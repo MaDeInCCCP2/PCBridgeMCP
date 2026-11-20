@@ -68,6 +68,7 @@ tr.skip td{background:var(--code);color:var(--mut);text-align:center;font-size:1
   <button class="b g" onclick="showTok=!showTok;draw()">Показать</button><button class="b g" onclick="cp('token')">Копировать</button></div></div>
   <div style="display:flex;gap:10px;align-items:center"><button class="b" id="chk" onclick="check()">Проверить подключение</button><span id="chkt" class="mut small"></span></div>
   <div id="steps" style="margin-top:8px"></div></div>
+ <div class="card"><h2>Аккаунты ngrok</h2><p class="mut small">При ошибке лимита трафика мост переключится на следующий добавленный аккаунт. Адрес MCP может измениться: скопируйте его заново в Notion. Токены хранятся открытым текстом в ngrok_accounts.json.</p><div id="accounts"></div><button class="b g" onclick="addAccount()">Добавить аккаунт</button></div>
  <div class="card"><h2>Режимы</h2><div id="modes"></div></div>
  <div class="card"><h2>Модули <span class="mut small">(переключение перезапускает мост)</span></h2><div id="mods"></div>
   <div class="row"><div class="l mut small">Остальные настройки - в мастере</div><button class="b g" onclick="A('settings')">Все настройки...</button></div></div>
@@ -91,13 +92,22 @@ async function A(d,x){const r=await api("/api/action",Object.assign({do:d},x||{}
 function stopAll(){if(confirm("Остановить PC Bridge полностью? Панель тоже закроется."))A("stop")}
 async function cp(w){const v=w=="url"?S.url:S.token;try{await navigator.clipboard.writeText(v)}catch(e){await A("copy",{what:w})}toast("Скопировано")}
 function sw(on,fn,dis){return `<label class="sw"><input type="checkbox" ${on?"checked":""} ${dis?"disabled":""} onchange="${fn}"><span></span></label>`}
+async function addAccount(){const name=prompt("Имя аккаунта ngrok:");if(!name)return;const token=prompt("Authtoken аккаунта ngrok:");if(!token)return;const domain=prompt("Домен этого аккаунта (необязательно):","");if(domain===null)return;await A("ngrok_add",{name,token,domain});load()}
+async function selectAccount(name){await A("ngrok_select",{name});toast("Переключаю туннель. Адрес MCP может измениться.")}
+async function deleteAccount(name){if(confirm("Удалить аккаунт «"+name+"»?"))await A("ngrok_delete",{name})}
 function draw(){if(!S)return;$("dot").style.background=S.color;$("dot").className=S.running?"blink":"";$("ver").textContent=S.version;
 $("head").textContent=S.headline;$("st").textContent=S.status;$("lc").textContent=S.last_call_text;$("act").textContent=S.running?("работает: "+S.last_tool):(S.activity||"ничего не делает");
 $("url").textContent=S.url||"туннель ещё не запущен";$("tokbox").style.display=S.token_auth?"":"none";$("tok").textContent=showTok?S.token:"•".repeat(24);
+const accounts=[{name:"По умолчанию"},...(S.ngrok_accounts||[])];$("accounts").replaceChildren(...accounts.map(x=>{const row=document.createElement("div");row.className="row";const label=document.createElement("div");label.className="l";label.textContent=x.name+(x.domain?" · "+x.domain:"");row.append(label);const active=(S.ngrok_active||"По умолчанию")==x.name;const b=document.createElement("button");b.className="b g";b.textContent=active?"Выбран":"Выбрать";b.disabled=active;b.onclick=()=>selectAccount(x.name);row.append(b);if(x.name!="По умолчанию"){const del=document.createElement("button");del.className="b g";del.textContent="Удалить";del.disabled=active;del.onclick=()=>deleteAccount(x.name);row.append(del)}return row}));
 const m=[["Пауза (Ctrl+Alt+Shift+P)","агент ничего не может делать",S.paused,"A('pause')"],["Только чтение",S.read_only_fixed?"задано в настройках":"агент смотрит, но ничего не меняет",S.read_only,"A('readonly')",S.read_only_fixed],
 ["Уведомления Windows","с кнопками «Показать» и «Отменить»",S.notifications,"A('notifications')"],["Автозапуск с Windows","",S.autostart,"A('autostart')"]];
 $("modes").innerHTML=m.map(x=>`<div class="row"><div class="l">${x[0]}<div class="mut small">${x[1]}</div></div>${sw(x[2],x[3],x[4])}</div>`).join("");
 $("mods").innerHTML=S.modules.map(x=>`<div class="row"><div class="l">${esc(x.name)}${x.risky?' <span class="badge">осторожно</span>':""}</div>${sw(x.on,`mod('${x.key}',this.checked,${x.risky})`)}</div>`).join("");
+const cu=S.computer_use;if(cu){const row=document.createElement("div");row.className="mut small";
+row.textContent=[cu.uia?"UIA":null,cu.playwright?"Playwright":null,cu.visual?"Визуальный ввод и OCR":null,
+cu.dxgi==="available"?"DXGI":cu.dxgi==="missing"?"DXGI: пакет не установлен":null,
+cu.adapter==="configured"?"Vision: настроен":cu.adapter==="missing"?"Vision: отсутствует скрипт":null,
+cu.last_operation?.status?"Ввод: "+cu.last_operation.status+(cu.last_operation.error_code?" ("+cu.last_operation.error_code+")":""):null].filter(Boolean).join(" · ");$("mods").append(row)}
 const c=S.check;if(c&&c.steps&&c.steps.length){$("chkt").textContent=c.running?"проверяю...":(c.ok?"всё в порядке, ":"есть проблема, ")+"проверено "+new Date(c.t*1000).toLocaleTimeString();
 $("steps").innerHTML=c.steps.map(s=>`<div class="step"><div class="i ${s.ok?"ok":"bad"}">${s.ok?"✓":"✗"}</div><div style="flex:1"><b>${esc(s.name)}</b> <span class="mut">${esc(s.detail)}</span>${s.fix?`<div class="fix">${esc(s.fix)}</div>`:""}</div></div>`).join("")}}
 function mod(k,on,risky){if(on&&risky&&!confirm("Этот модуль даёт агенту больше власти над ПК. Включить и перезапустить мост?")){load();return}A("module",{key:k,on:on});toast("Перезапускаю мост...")}
@@ -105,7 +115,7 @@ async function check(){$("chk").disabled=true;$("chkt").textContent="прове�
 async function load(){try{S=await api("/api/state");draw()}catch(e){$("head").textContent="Панель не отвечает - PC Bridge остановлен?";$("dot").style.background="#999"}}
 // ---- feed ----
 const MODS=[["Unreal Engine",/^unreal_|^ue_/],["Blender",/^blender_/],["Roblox",/^roblox_/],["Командная строка",/^(run_command|run_|job_|start_job|read_job|stop_job|list_jobs)/],
-["Экран и ввод",/^(screenshot|screen_|list_windows|focus_window|read_screen|find_text|click|mouse_|key|type_|hotkey|scroll)/],["Интернет",/^(http_|web_|fetch|download)/],
+["Экран и ввод",/^(computer_|observe_focus|screenshot|screen_|list_windows|focus_window|read_screen|find_text|click|mouse_|key|type_|hotkey|scroll)/],["Интернет",/^(http_|web_|fetch|download)/],
 ["Буфер, файлы, процессы",/^(clipboard|open_path|list_processes|kill_process|notify)/],["Git",/^git_/],["История и отмена",/^(undo_|list_changes)/]];
 MODS.forEach(m=>$("mod").insertAdjacentHTML("beforeend",`<option>${m[0]}</option>`));$("mod").insertAdjacentHTML("beforeend","<option>Файлы и код</option>");
 function modOf(tool){for(const m of MODS)if(m[1].test(tool))return m[0];return tool?"Файлы и код":""}

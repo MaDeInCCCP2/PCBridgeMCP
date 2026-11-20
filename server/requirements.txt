@@ -6,3 +6,11 @@ send2trash>=1.8,<2   # delete_path -> Recycle Bin
 pyautogui>=0.9.54,<1  # only for the 'input' module (mouse/keyboard)
 psutil>=5.9,<8        # processes, PC load, supervisor
 pystray>=0.19,<1      # tray icon (supervisor.py)
+
+# Semantic Computer Use, Windows screen module (lazy-loaded in an isolated worker).
+pywinauto>=0.6.8,<0.7; sys_platform == "win32"
+comtypes>=1.4.8,<2; sys_platform == "win32"
+
+playwright>=1.64,<2  # optional browser module, isolated worker
+
+# Optional DXGI backend: setup.ps1 installs windows-capture>=2.0.1,<3 only when enabled.

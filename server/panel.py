@@ -8,6 +8,7 @@ cannot send it), GET requests never change anything.
 import difflib
 import hmac
 import json
+import importlib.util
 import secrets
 import socket
 import threading
@@ -22,7 +23,9 @@ from xml.sax.saxutils import escape as xml_escape
 MAX_TEXT = 400_000
 FEED_START = 300_000
 MODULE_KEYS = ("enable_internet", "enable_blender", "enable_roblox", "enable_unreal", "enable_screen",
-               "enable_input", "enable_desktop", "enable_shell", "full_disk")
+               "enable_input", "enable_desktop", "enable_shell", "enable_browser", "full_disk")
+OPTIONAL_COMPUTER_MODULES = (("enable_dxgi_capture", "Захват GPU через DXGI"),
+                             ("enable_vision_adapter", "Локальный адаптер распознавания"))
 RISKY_KEYS = ("enable_shell", "full_disk", "enable_input")
 
 
@@ -183,7 +186,7 @@ def read_feed(path: Path, pos: int = -1) -> dict:
     if reset and start > 0:
         nl = data.find(b"\n")
         data = data[nl + 1:] if nl >= 0 else data
-    return {"text": data.decode("utf-8", errors="replace"), "pos": start + len(data) if not reset else size,
+    return {"text": data.decode("utf-8", errors="replace").replace("\r\n", "\n"), "pos": start + len(data) if not reset else size,
             "reset": reset}
 
 
@@ -313,6 +316,8 @@ class Panel:
         s, m = self.sup, self.m
         act = read_json(m.ACTIVITY)
         ro_cfg = bool(s.cfg.get("read_only"))
+        operations = read_json(m.LOGS / "computer-operations.json", [])
+        last_visual = operations[-1] if isinstance(operations, list) and operations else {}
         try:
             color = s.color()
         except Exception:
@@ -328,7 +333,20 @@ class Panel:
             "paused": m.PAUSE_FLAG.exists(), "read_only": m.RO_FLAG.exists() or ro_cfg, "read_only_fixed": ro_cfg,
             "notifications": not m.NOTIFY_OFF.exists(), "autostart": s.startup_lnk().exists(),
             "modules": [{"key": k, "name": n, "on": bool(s.cfg.get(k)), "risky": k in RISKY_KEYS}
-                        for k, n in s.MODULE_NAMES],
+                        for k, n in (*s.MODULE_NAMES, *OPTIONAL_COMPUTER_MODULES)],
+            "computer_use": {
+                "last_operation": {k: last_visual.get(k) for k in ("status", "phase", "error_code")}
+                                  if isinstance(last_visual, dict) else {},
+                "uia": bool(s.cfg.get("enable_screen")),
+                "playwright": bool(s.cfg.get("enable_browser") and s.cfg.get("enable_internet")),
+                "visual": bool(s.cfg.get("enable_screen")),
+                "adapter": ("configured" if Path(s.cfg.get("vision_adapter_path") or ".").is_file()
+                            else "missing") if s.cfg.get("enable_vision_adapter") else "disabled",
+                "dxgi": ("available" if importlib.util.find_spec("windows_capture") else "missing")
+                        if s.cfg.get("enable_dxgi_capture") else "disabled",
+            },
+            "ngrok_accounts": [{"name": x["name"], "domain": x.get("domain", "")} for x in getattr(s.ngrok, "profiles", lambda: {})().get("accounts", [])],
+            "ngrok_active": getattr(s.ngrok, "profiles", lambda: {})().get("active", ""),
             "workspace": str(s.cfg.get("workspace") or m.ROOT), "check": self.check_result,
         }
 
@@ -362,6 +380,33 @@ class Panel:
 
     def action(self, what: str, data: dict) -> dict:
         s, m = self.sup, self.m
+        if what in ("ngrok_add", "ngrok_select", "ngrok_delete"):
+            profiles = s.ngrok.profiles()
+            accounts = profiles.setdefault("accounts", [])
+            name = str(data.get("name", "")).strip()
+            if not name or len(name) > 80 or (name == "По умолчанию" and what != "ngrok_select"):
+                return {"error": "Укажите другое имя аккаунта (до 80 символов)"}
+            if what == "ngrok_add":
+                token = str(data.get("token", "")).strip()
+                domain = str(data.get("domain", "")).strip()
+                if not token or any(c.isspace() for c in token):
+                    return {"error": "Укажите корректный authtoken"}
+                if any(x.get("name") == name for x in accounts):
+                    return {"error": "Аккаунт с таким именем уже существует"}
+                accounts.append({"name": name, "token": token, "domain": domain})
+            elif what == "ngrok_delete":
+                if profiles.get("active") == name:
+                    return {"error": "Сначала выберите другой аккаунт"}
+                profiles["accounts"] = [x for x in accounts if x.get("name") != name]
+            else:
+                if name != "По умолчанию" and not any(x.get("name") == name for x in accounts):
+                    return {"error": "Аккаунт не найден"}
+                profiles["active"] = "" if name == "По умолчанию" else name
+            m.write_json(m.ROOT / "ngrok_accounts.json", profiles)
+            if what == "ngrok_select":
+                s.ngrok.exhausted.clear()
+                s.ngrok.switch_requested = True
+            return {"ok": True}
         if what == "pause":
             s.toggle_pause()
         elif what == "readonly":
@@ -375,7 +420,7 @@ class Panel:
             s.restart_bridge()
         elif what == "module":
             key = data.get("key")
-            if key not in MODULE_KEYS:
+            if key not in MODULE_KEYS and key not in dict(OPTIONAL_COMPUTER_MODULES):
                 return {"error": "нет такого модуля"}
             s.set_cfg(key, bool(data.get("on")))
             s.log("PANEL module", key, bool(data.get("on")))

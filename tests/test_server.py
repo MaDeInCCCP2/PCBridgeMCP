@@ -225,7 +225,10 @@ class DangerousCommands(unittest.TestCase):
         self.assertEqual(S.danger_reasons("powershell -File .\\ok.ps1", str(WORK)), [])
 
     def test_refused_without_a_person(self):
-        r = S.check_command("shutdown /s /t 0", str(WORK))
+        # Unit tests must never display a live confirmation or execute shutdown.
+        from unittest.mock import patch
+        with patch.object(S, "_ask_user", return_value="unavailable"):
+            r = S.check_command("shutdown /s /t 0", str(WORK))
         self.assertFalse(r["ran"])
         self.assertIn(r["user_answer"], ("unavailable", "no", "timeout", "block"))
         self.assertIsNone(S.check_command("cargo test", str(WORK)))

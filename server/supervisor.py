@@ -193,7 +193,7 @@ class Child:
         fe = open(err, "wb") if err and err != out else subprocess.STDOUT
         try:
             self.proc = subprocess.Popen([str(a) for a in argv], cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=fo,
-                                         stderr=fe, creationflags=NO_WINDOW | GROUP)
+                                         stderr=fe, creationflags=NO_WINDOW | GROUP, env=self.environment())
         finally:
             fo.close()
             if fe is not subprocess.STDOUT:
@@ -209,6 +209,9 @@ class Child:
             kill_tree(self.proc)
         self.proc = None
         self.status = "off"
+
+    def environment(self):
+        return None
 
     def failed(self, why: str) -> None:
         """Schedule a restart with back-off."""
@@ -261,6 +264,18 @@ class Ngrok(Child):
         self.error = ""
         self.bad_checks = 0
         self.last_check = 0.0
+        self.exhausted = set()
+        self.switch_requested = False
+
+    def profiles(self):
+        try:
+            data = json.loads((ROOT / "ngrok_accounts.json").read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def environment(self):
+        return None
 
     def exe(self) -> str:
         c = self.sup.cfg.get("ngrok_path")
@@ -279,12 +294,29 @@ class Ngrok(Child):
             self.error = "ngrok не найден - запустите START.bat"
             return None
         self.url = ""
-        return [exe] + ngrok_args(self.sup.cfg, int(self.sup.cfg.get("port", 8765))), LOGS / "ngrok.log", None
+        data = self.profiles()
+        account = next((x for x in data.get("accounts", []) if x.get("name") == data.get("active")), None)
+        cfg = dict(self.sup.cfg)
+        args = ngrok_args(cfg, int(cfg.get("port", 8765)))
+        if account:
+            cfg["ngrok_domain"] = account.get("domain", "")
+            args = ngrok_args(cfg, int(cfg.get("port", 8765)))
+            # The global config's token takes precedence over NGROK_AUTHTOKEN in
+            # the agent. Use an isolated config so the selected account is used.
+            account_config = LOGS / "ngrok-active.json"
+            write_json(account_config, {"version": "3", "agent": {"authtoken": account["token"]}})
+            args += ["--config", str(account_config)]
+        return [exe] + args, LOGS / "ngrok.log", None
 
     def check(self) -> None:
+        if self.switch_requested:
+            self.switch_requested = False
+            self.stop()
+            self.url, self.error = "", ""
+            self.next_try = self.bad_checks = 0
         if self.sup.server.status != "ok" and not self.alive():
             return  # the tunnel waits for the server
-        if self.alive():
+        if self.alive() or self.proc is not None:
             try:
                 info = parse_ngrok_log((LOGS / "ngrok.log").read_text(encoding="utf-8", errors="replace")[-200_000:])
             except OSError:
@@ -306,12 +338,13 @@ class Ngrok(Child):
                     self.sup.event("tunnel_error", f"ngrok: {NGROK_HINTS.get(code, info['error'])}")
                     self.stop()
                     self.status = "error"
-                    self.next_try = time.time() + 600  # one more try in 10 minutes (the user may fix it)
+                    self.next_try = float("inf")  # wait for the user to select an account or restart
                 elif time.time() - self.started > 30:
                     self.failed(info["error"])
-            elif time.time() - self.started > 45:
+            elif self.alive() and time.time() - self.started > 45:
                 self.failed("no tunnel after 45s")
-            return
+            if self.alive() or self.proc is None:
+                return
         if self.proc is not None:
             if self.status == "ok":
                 self.sup.event("tunnel_down", "Туннель ngrok упал - перезапускаю")
@@ -327,13 +360,19 @@ class Ngrok(Child):
         req = urllib.request.Request(self.url.rstrip("/") + "/.well-known/pcbridge-ping",
                                      headers={"ngrok-skip-browser-warning": "1", "User-Agent": "pcbridge-supervisor"})
         ok = False
+        code = ""
         try:
             with urllib.request.urlopen(req, timeout=15) as r:
-                ok = not r.headers.get("ngrok-error-code")
+                code = r.headers.get("ngrok-error-code", "")
+                ok = not code
         except urllib.error.HTTPError as e:
-            ok = not e.headers.get("ngrok-error-code")  # 404 from OUR server = the tunnel works
+            code = e.headers.get("ngrok-error-code", "")
+            ok = not code  # 404 from OUR server = the tunnel works
         except Exception:
             ok = False
+        if code.upper() in ("725", "ERR_NGROK_725"):
+            self.quota_exceeded()
+            return
         if ok:
             self.bad_checks = 0
             return
@@ -343,6 +382,29 @@ class Ngrok(Child):
             self.bad_checks = 0
             self.sup.event("tunnel_down", "Туннель не отвечает (сон / сеть?) - переподключаю")
             self.failed("public URL does not answer")
+
+    def quota_exceeded(self):
+        data = self.profiles()
+        self.exhausted.add(data.get("active", ""))
+        candidate = next((x for x in data.get("accounts", []) if x.get("name") not in self.exhausted), None)
+        self.stop()
+        self.url = ""
+        try:
+            (ROOT / "URL.txt").write_text("", encoding="utf-8")
+        except OSError:
+            pass
+        self.bad_checks = 0
+        if candidate:
+            data["active"] = candidate["name"]
+            write_json(ROOT / "ngrok_accounts.json", data)
+            self.next_try = 0
+            self.error = ""
+            self.sup.event("tunnel_switch", "Лимит ngrok исчерпан; переключаю аккаунт. Обновите адрес MCP после подключения.")
+        else:
+            self.error = "ERR_NGROK_725: лимит трафика исчерпан; добавьте аккаунт или дождитесь сброса"
+            self.status = "error"
+            self.next_try = time.time() + 3600
+            self.sup.event("tunnel_error", self.error)
 
 
 class Llama(Child):
@@ -709,7 +771,7 @@ class Supervisor:
         subprocess.run(["clip"], input=text.encode("utf-16-le"), creationflags=NO_WINDOW) if IS_WIN else None
 
     MODULE_NAMES = (("enable_internet", "Интернет"), ("enable_blender", "Blender"), ("enable_roblox", "Roblox Studio"),
-                    ("enable_unreal", "Unreal Engine 5"), ("enable_screen", "Скриншоты"),
+                    ("enable_unreal", "Unreal Engine 5"), ("enable_screen", "Скриншоты"), ("enable_browser", "Браузер Playwright"),
                     ("enable_input", "Мышь и клавиатура"), ("enable_desktop", "Буфер, файлы, процессы"),
                     ("enable_shell", "Командная строка"), ("full_disk", "Весь диск"))
 
@@ -859,7 +921,7 @@ class Supervisor:
         try:
             self.panel_mod = load_panel()
             mod = types.SimpleNamespace(LOGS=LOGS, ROOT=ROOT, ACTIVITY=ACTIVITY, PAUSE_FLAG=PAUSE_FLAG, RO_FLAG=RO_FLAG,
-                                        NOTIFY_OFF=NOTIFY_OFF, ctrl_key=ctrl_key)
+                                        NOTIFY_OFF=NOTIFY_OFF, ctrl_key=ctrl_key, write_json=write_json)
             p = self.panel_mod.Panel(self, mod)
             if p.start():
                 self.panel = p

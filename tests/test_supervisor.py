@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -76,6 +77,58 @@ class SupervisorState(unittest.TestCase):
         sup = S.Supervisor()
         sup.url_changed("", "https://q.ngrok-free.app")
         self.assertEqual((S.ROOT / "URL.txt").read_text(encoding="utf-8").strip(), "https://q.ngrok-free.app/mcp")
+
+    def test_quota_rotates_without_exposing_token_in_command(self):
+        sup = S.Supervisor()
+        S.write_json(S.ROOT / "ngrok_accounts.json", {"accounts": [
+            {"name": "reserve", "token": "secret-token", "domain": "reserve.ngrok.app"}]})
+        tunnel = sup.ngrok
+        tunnel.quota_exceeded()
+        self.assertEqual(tunnel.profiles()["active"], "reserve")
+        with patch.object(tunnel, "exe", return_value="ngrok"):
+            argv = tunnel.cmd()[0]
+        self.assertIn("--url=https://reserve.ngrok.app", argv)
+        self.assertNotIn("secret-token", " ".join(argv))
+        self.assertEqual(json.loads(Path(argv[argv.index("--config") + 1]).read_text(encoding="utf-8"))["agent"]["authtoken"], "secret-token")
+        tunnel.quota_exceeded()
+        self.assertEqual(tunnel.status, "error")
+        self.assertIn("ERR_NGROK_725", tunnel.error)
+
+    def test_probe_rotates_only_for_quota_error(self):
+        sup = S.Supervisor()
+        tunnel = sup.ngrok
+        tunnel.url = "https://example.ngrok.app"
+        error = S.urllib.error.HTTPError(tunnel.url, 429, "quota", {"ngrok-error-code": "ERR_NGROK_725"}, None)
+        with patch.object(S.urllib.request, "urlopen", side_effect=error), patch.object(tunnel, "quota_exceeded") as switch:
+            tunnel.probe()
+            switch.assert_called_once()
+
+    def test_exited_ngrok_permanent_error_does_not_restart(self):
+        sup = S.Supervisor()
+        sup.server.status = "ok"
+        tunnel = sup.ngrok
+        tunnel.proc = unittest.mock.Mock()
+        tunnel.proc.poll.return_value = 1
+        (S.LOGS / "ngrok.log").write_text("ERR_NGROK_320", encoding="utf-8")
+        tunnel.check()
+        self.assertEqual(tunnel.status, "error")
+        self.assertEqual(tunnel.error, "ERR_NGROK_320")
+        self.assertFalse(tunnel.due())
+
+    def test_started_panel_can_manage_ngrok_accounts(self):
+        import panel
+        sup = S.Supervisor()
+        with patch.object(S, "load_panel", return_value=panel), patch.object(panel.Panel, "start", return_value=1234):
+            sup.start_panel()
+        self.assertIsNotNone(sup.panel)
+        accounts_file = S.ROOT / "ngrok_accounts.json"
+        accounts_file.unlink(missing_ok=True)
+        self.assertEqual(sup.panel.action("ngrok_add", {"name": "reserve", "token": "secret"}), {"ok": True})
+        self.assertEqual(sup.panel.action("ngrok_select", {"name": "reserve"}), {"ok": True})
+        self.assertEqual(sup.ngrok.profiles()["active"], "reserve")
+        self.assertNotIn("secret", str(sup.panel.state().get("ngrok_accounts")))
+        self.assertEqual(sup.panel.action("ngrok_select", {"name": "По умолчанию"}), {"ok": True})
+        self.assertEqual(sup.panel.action("ngrok_delete", {"name": "reserve"}), {"ok": True})
 
 
 if __name__ == "__main__":
