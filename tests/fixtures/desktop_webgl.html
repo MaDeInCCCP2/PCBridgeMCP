@@ -1,0 +1,49 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>PCBridge WebGL Fixture</title>
+<h1>PCBridge WebGL test</h1>
+<button id="change">PCBridge change pixel</button>
+<p id="clicks">PCBridge clicks: 0</p>
+<p id="renderer"></p>
+<p id="pixel"></p>
+<canvas id="frame" width="32" height="32" aria-label="PCBridge WebGL sample"></canvas>
+<script>
+const canvas = document.getElementById('frame');
+const renderer = document.getElementById('renderer');
+const pixel = document.getElementById('pixel');
+const button = document.getElementById('change');
+const clicks = document.getElementById('clicks');
+
+const strict = canvas.getContext('webgl', {failIfMajorPerformanceCaveat: true});
+const gl = strict || canvas.getContext('webgl');
+let mode = 'unavailable';
+if (gl) {
+    const debug = gl.getExtension('WEBGL_debug_renderer_info');
+    const description = debug ? gl.getParameter(debug.UNMASKED_RENDERER_WEBGL) : '';
+    const software = /swiftshader|llvmpipe|software|basic render|warp/i.test(description);
+    const hardware = /nvidia|geforce|radeon|intel|qualcomm|adreno|arm mali/i.test(description);
+    mode = software ? 'software' : strict && hardware ? 'hardware-reported' : 'unknown';
+}
+renderer.textContent = 'PCBridge WebGL renderer: ' + mode;
+
+function paint(red, green) {
+    if (!gl) {
+        pixel.textContent = 'PCBridge pixel: unavailable';
+        return;
+    }
+    gl.clearColor(red, green, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    const rgba = new Uint8Array(4);
+    gl.readPixels(8, 8, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+    const expected = [red * 255, green * 255, 0, 255];
+    pixel.textContent = rgba.every((value, i) => value === expected[i])
+        ? (green ? 'PCBridge pixel: green verified' : 'PCBridge pixel: red verified')
+        : 'PCBridge pixel: mismatch';
+}
+paint(1, 0);
+let count = 0;
+button.addEventListener('click', () => {
+    paint(0, 1);
+    clicks.textContent = 'PCBridge clicks: ' + (++count);
+});
+</script>

@@ -36,7 +36,7 @@ class NgrokLog(unittest.TestCase):
 
 class Helpers(unittest.TestCase):
     def test_args(self):
-        self.assertEqual(S.ngrok_args({}, 8765), ["http", "8765", "--host-header=rewrite", "--inspect=false", "--log=stdout"])
+        self.assertEqual(S.ngrok_args({}, 8765), ["http", "8765", "--inspect=false", "--log=stdout"])
         self.assertEqual(S.ngrok_args({"ngrok_domain": "https://x.ngrok.app/"}, 1)[-1], "--url=https://x.ngrok.app")
         self.assertEqual(S.ngrok_args({"ngrok_domain": "x.ngrok.app", "ngrok_url_flag": "domain"}, 1)[-1],
                          "--domain=x.ngrok.app")
@@ -76,6 +76,9 @@ class SupervisorState(unittest.TestCase):
     def test_url_changed_writes_file(self):
         sup = S.Supervisor()
         sup.url_changed("", "https://q.ngrok-free.app")
+        self.assertEqual(S.TUNNEL_ORIGIN.read_text(encoding="utf-8"), "https://q.ngrok-free.app")
+        sup.ngrok.stop()
+        self.assertFalse(S.TUNNEL_ORIGIN.exists())
         self.assertEqual((S.ROOT / "URL.txt").read_text(encoding="utf-8").strip(), "https://q.ngrok-free.app/mcp")
 
     def test_quota_rotates_without_exposing_token_in_command(self):

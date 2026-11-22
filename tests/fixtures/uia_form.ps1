@@ -28,7 +28,12 @@ $password.UseSystemPasswordChar = $true
 $password.Text = 'DO_NOT_EXPOSE_UIA_TEST_SECRET'
 $password.Location = New-Object System.Drawing.Point(20,165)
 $button.Add_Click({ $status.Text = 'Saved: ' + $inputBox.Text })
-$form.Controls.AddRange(@($inputBox, $button, $status, $checkbox, $password))
+$exitButton = New-Object System.Windows.Forms.Button
+$exitButton.AccessibleName = 'PCBridge exit'
+$exitButton.Text = 'Exit'
+$exitButton.Location = New-Object System.Drawing.Point(20,200)
+$exitButton.Add_Click({ $form.Close() })
+$form.Controls.AddRange(@($inputBox, $button, $status, $checkbox, $password, $exitButton))
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 90000
 $timer.Add_Tick({ $form.Close() })

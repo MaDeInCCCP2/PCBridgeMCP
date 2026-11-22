@@ -53,6 +53,29 @@ def outlines(image, limit):
              "source": "contour", "actionable": False} for box in boxes[:limit]]
 
 
+def adapter_detections(candidates, size):
+    if not isinstance(candidates, list) or len(candidates) > 200:
+        raise ValueError("Invalid candidate list")
+    width, height = size
+    result = []
+    for detection in candidates:
+        if not isinstance(detection, dict):
+            continue
+        box = detection.get("box")
+        if not isinstance(box, list) or len(box) != 4 or any(type(n) is not int for n in box):
+            continue
+        x, y, w, h = box
+        if not (0 <= x < x + w <= width and 0 <= y < y + h <= height):
+            continue
+        score = detection.get("confidence")
+        if type(score) not in (int, float) or not math.isfinite(score) or not 0 <= score <= 1:
+            score = None
+        result.append({"box": box, "label": str(detection.get("label", ""))[:256],
+                       "role": str(detection.get("role", ""))[:64], "confidence": score,
+                       "source": "vision_adapter", "actionable": False})
+    return result
+
+
 def grounding(frame, query, exact, limit, ocr, find_text, ocr_box, adapter):
     with Image.open(io.BytesIO(frame["jpeg"])) as image:
         found = []
@@ -75,24 +98,7 @@ def grounding(frame, query, exact, limit, ocr, find_text, ocr_box, adapter):
                 found.append(contour)
         if adapter:
             try:
-                candidates = adapter(frame, query)
-                if not isinstance(candidates, list) or len(candidates) > 200:
-                    raise ValueError("Invalid candidate list")
-                for detection in candidates:
-                    if not isinstance(detection, dict):
-                        continue
-                    box = detection.get("box")
-                    if not isinstance(box, list) or len(box) != 4 or any(type(n) is not int for n in box):
-                        continue
-                    x, y, w, h = box
-                    if not (0 <= x < x+w <= image.width and 0 <= y < y+h <= image.height):
-                        continue
-                    score = detection.get("confidence")
-                    if type(score) not in (int, float) or not math.isfinite(score) or not 0 <= score <= 1:
-                        score = None
-                    found.append({"box": box, "label": str(detection.get("label", ""))[:256],
-                                  "role": str(detection.get("role", ""))[:64], "confidence": score,
-                                  "source": "vision_adapter", "actionable": False})
+                found.extend(adapter_detections(adapter(frame, query), image.size))
             except (OSError, ValueError) as exc:
                 diagnostics["adapter_error"] = getattr(exc, "code", type(exc).__name__)
         return found[:limit], diagnostics

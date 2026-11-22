@@ -172,6 +172,54 @@ class VisualControl(unittest.TestCase):
         self.assertTrue(status["verified"])
         self.assertEqual(status["evidence"], "pixel_comparison")
 
+    def test_change_bounds_include_region_offset_and_empty_comparison(self):
+        same, _ = self.controller.verify(self.frame, [2, 3, 10, 12], "unchanged")
+        self.assertTrue(same["verified"])
+        self.assertIsNone(same["changed_bounds"])
+        self.desktop.pixel = "red"
+        changed, _ = self.controller.verify(self.frame, [2, 3, 10, 12], threshold=128)
+        self.assertEqual(changed["changed_bounds"], [2, 3, 10, 12])
+        self.assertEqual(changed["changed_fraction"], 1.0)
+
+    def test_dirty_regions_group_adjacent_tiles_and_bound_fragmented_output(self):
+        mask = Image.new("L", (240, 160))
+        draw = ImageDraw.Draw(mask)
+        draw.rectangle((60, 8, 68, 9), fill=255)
+        draw.rectangle((194, 10, 202, 15), fill=255)
+        expected = [(60, 8, 69, 10), (194, 10, 203, 16)]
+        self.assertEqual(V.changed_components(mask, mask.getbbox()), (expected, False))
+        self.assertEqual(V.changed_components(mask, mask.getbbox(), limit=1), ([(60, 8, 203, 16)], True))
+        self.desktop.pixel = "red"
+        diff, _ = self.controller.verify(self.frame, [2, 3, 10, 12], threshold=128, detailed=True)
+        self.assertEqual(diff["changed_regions"], [[2, 3, 10, 12]])
+        self.assertFalse(diff["regions_coalesced"])
+
+    def test_clients_cannot_access_each_others_refs_or_cancel_visual_operations(self):
+        owner = ["first"]
+        history = []
+        scoped = V.Controller(self.desktop, lambda write: None, lambda window: False,
+                              principal=lambda: owner[0], persist=history.extend)
+        ref = scoped.open_window("hwnd:12")
+        frame = scoped.observe(ref)["public"]["capture_id"]
+        result, _ = scoped.run(ref, frame, [{"op": "wait", "ms": 0}], "same_id_01", "capture", 60000, 3000)
+        self.assertTrue(result["ok"])
+        owner[0] = "second"
+        with self.assertRaisesRegex(V.VisualError, "Window reference"):
+            scoped.observe(ref)
+        with self.assertRaisesRegex(V.VisualError, "Capture is missing"):
+            scoped.frame(ref, frame)
+        with self.assertRaisesRegex(V.VisualError, "Unknown"):
+            scoped.operation("same_id_01", cancel=True)
+        other_ref = scoped.open_window("hwnd:12")
+        other_frame = scoped.observe(other_ref)["public"]["capture_id"]
+        other, _ = scoped.run(other_ref, other_frame, [{"op": "wait", "ms": 0}], "same_id_01", "capture", 60000, 3000)
+        self.assertEqual(other["window_ref"], other_ref)
+        restored = V.Controller(self.desktop, lambda write: None, lambda window: False,
+                                principal=lambda: owner[0], history=history)
+        self.assertEqual(restored.operation("same_id_01")["window_ref"], other_ref)
+        owner[0] = "first"
+        self.assertEqual(restored.operation("same_id_01")["window_ref"], ref)
+
     def test_parse_all_steps_before_any_input_and_require_confirmation(self):
         with self.assertRaises(V.VisualError):
             self.run_steps([{"op":"key", "key":"w"}, {"op":"drag", "x":5}])

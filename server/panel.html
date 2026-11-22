@@ -2,30 +2,58 @@
 <html lang="ru"><head><meta charset="utf-8"><title>PC Bridge</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-:root{--bg:#f6f7f9;--card:#fff;--fg:#1d1f23;--mut:#6b7280;--line:#e5e7eb;--acc:#2563eb;--ok:#16a34a;--bad:#dc2626;--warn:#d97706;
---add:#e6ffec;--addt:#116329;--del:#ffebe9;--delt:#82071e;--chg:#fff8c5;--code:#f3f4f6}
+:root{color-scheme:light dark;--topbar:48px;--bg:#f6f7f9;--card:#fff;--fg:#1d1f23;--mut:#6b7280;--line:#e5e7eb;--acc:#2563eb;--ok:#16a34a;--bad:#dc2626;--warn:#d97706;
+--add:#e6ffec;--addt:#116329;--del:#ffebe9;--delt:#82071e;--chg:#fff8c5;--code:#f3f4f6;--soft-accent:#eff6ff;--accent-border:#bfdbfe;--selected:#e9f7ee;--selected-text:#166534}
 @media (prefers-color-scheme:dark){:root{--bg:#111318;--card:#1a1d23;--fg:#e5e7eb;--mut:#9ca3af;--line:#2b2f36;--acc:#60a5fa;
---add:#12361f;--addt:#7ee2a8;--del:#3d1518;--delt:#ffa8a8;--chg:#3a3413;--code:#22262d}}
+--add:#12361f;--addt:#7ee2a8;--del:#3d1518;--delt:#ffa8a8;--chg:#3a3413;--code:#22262d;--soft-accent:#18283e;--accent-border:#344969;--selected:#1b3428;--selected-text:#a4e2b9}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 "Segoe UI",system-ui,sans-serif}
-header{display:flex;align-items:center;gap:14px;padding:12px 20px;background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
-#dot{width:14px;height:14px;border-radius:50%;background:#999;flex:none}#dot.blink{animation:b .6s infinite alternate}
-@keyframes b{to{opacity:.25}}
-h1{font-size:16px;margin:0}#head{color:var(--mut);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-nav button{background:none;border:0;color:var(--mut);font:inherit;padding:8px 12px;border-radius:8px;cursor:pointer}
-nav button.on{background:var(--code);color:var(--fg);font-weight:600}
-main{padding:18px 20px;max-width:1400px;margin:auto}.tab{display:none}.tab.on{display:block}
+header{position:sticky;top:0;z-index:2;height:var(--topbar);display:flex;align-items:center;gap:10px;padding:0 20px;background:var(--card);border-bottom:1px solid var(--line)}
+#dot{width:10px;height:10px;border-radius:50%;background:#999;flex:none}
+h1{font-size:16px;margin:0;white-space:nowrap}#head{color:var(--mut);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.workbench{display:grid;grid-template-columns:192px minmax(0,1fr);align-items:start}
+nav{position:sticky;top:var(--topbar);display:grid;align-content:start;gap:4px;background:var(--card);border-right:1px solid var(--line);padding:14px 12px;height:calc(100dvh - var(--topbar));overflow:auto}
+nav button{background:none;border:0;color:var(--mut);font:inherit;min-height:38px;padding:7px 12px;border-radius:7px;cursor:pointer;text-align:left}
+nav button:hover{background:var(--code);color:var(--fg)}
+nav button.on{background:var(--soft-accent);color:var(--fg);box-shadow:inset 2px 0 var(--acc);font-weight:600}
+:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+main{padding:24px clamp(16px,2.4vw,32px);max-width:1440px;width:100%;min-width:0;margin:0 auto}
+h2{font-size:22px;line-height:1.25;margin:0 0 18px}.card h3{font-size:15px;margin:0 0 10px}.tab{display:none}.tab.on{display:block}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:16px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px}.card h2{font-size:14px;margin:0 0 10px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:16px}.card+.card{margin-top:0}.row{overflow-wrap:anywhere}
 .row{display:flex;align-items:center;gap:10px;padding:6px 0;border-top:1px solid var(--line)}.row:first-of-type{border-top:0}
 .row .l{flex:1}.mut{color:var(--mut)}.small{font-size:12px}
 button.b{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:7px 14px;font:inherit;cursor:pointer}
 button.g{background:var(--code);color:var(--fg)}button.r{background:var(--bad)}button:disabled{opacity:.5;cursor:default}
-.sw{position:relative;width:38px;height:22px;flex:none}.sw input{display:none}.sw span{position:absolute;inset:0;background:#c4c8cf;border-radius:22px;transition:.15s;cursor:pointer}
+.sw{position:relative;width:38px;height:22px;flex:none}.sw input{position:absolute;opacity:0;width:100%;height:100%;inset:0}.sw input:focus-visible+span{outline:2px solid var(--acc);outline-offset:3px}.sw span{position:absolute;inset:0;background:#c4c8cf;border-radius:22px;transition:.15s;cursor:pointer}
 .sw span:before{content:"";position:absolute;width:16px;height:16px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.15s}
 .sw input:checked+span{background:var(--ok)}.sw input:checked+span:before{transform:translateX(16px)}.sw input:disabled+span{opacity:.5}
 code,.mono{font-family:Consolas,"Cascadia Mono",monospace;font-size:12.5px}
-.field{display:flex;gap:6px;align-items:center;background:var(--code);border-radius:8px;padding:6px 8px;margin:4px 0 8px}
-.field code{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.connection-grid{display:grid;grid-template-columns:minmax(0,1.12fr) minmax(0,1fr);gap:16px;align-items:start}
+.connection-grid .card{min-width:0;padding:18px}
+.connection-grid h3{margin-bottom:14px}
+.connection-label{display:block;margin:14px 0 5px}
+.field{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:7px 8px 7px 12px}
+.field code{flex:1 1 180px;min-width:0;overflow-wrap:anywhere;user-select:all}
+.field-actions,.account-actions{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-left:auto}
+#copy-url{background:var(--soft-accent);color:var(--acc);box-shadow:inset 0 0 0 1px var(--accent-border)}
+.connection-grid button:not(:disabled):hover{box-shadow:inset 0 0 0 1px var(--acc)}
+.account-row{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;padding:10px 0}
+.account-row+.account-row{border-top:1px solid var(--line)}
+.account-label{flex:1 1 120px;min-width:0;overflow-wrap:anywhere;font-weight:600}
+.account-domain{display:block;font-weight:400}
+.account-active{background:var(--selected);color:var(--selected-text);border-radius:6px;font-size:12px;padding:3px 8px}
+.account-footer{border-top:1px solid var(--line);padding-top:12px;margin-top:2px}
+@media(max-width:1080px){.connection-grid{grid-template-columns:minmax(0,1fr)}}
+@media(max-width:740px){
+  .workbench,.grid{grid-template-columns:minmax(0,1fr)}
+  nav{position:static;height:auto;display:flex;flex-wrap:wrap;padding:8px 12px;border-right:0;border-bottom:1px solid var(--line)}
+  nav button{white-space:nowrap}
+  main{padding-top:18px}
+}
+@media(max-width:390px){
+  .connection-grid .card{padding:14px}
+  .field-actions,.account-actions{margin-left:0}
+}
 .step{display:flex;gap:10px;padding:7px 0;border-top:1px solid var(--line)}.step:first-child{border-top:0}
 .step .i{font-weight:700;width:18px}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}
 .fix{background:var(--del);color:var(--delt);border-radius:8px;padding:6px 10px;margin-top:4px}
@@ -48,31 +76,164 @@ table.d td.n{width:46px;color:var(--mut);text-align:right;user-select:none}table
 tr.del td.c.L,tr.chg td.c.L{background:var(--del)}tr.add td.c.R,tr.chg td.c.R{background:var(--add)}tr.chg td.c{}
 tr.skip td{background:var(--code);color:var(--mut);text-align:center;font-size:11px}
 #banner{display:none;background:var(--chg);border:1px solid var(--warn);border-radius:12px;padding:12px 16px;margin-bottom:12px;gap:10px;align-items:center}
-#toast{position:fixed;right:20px;bottom:20px;background:var(--fg);color:var(--bg);padding:10px 16px;border-radius:10px;display:none;max-width:420px}
+#toast{position:fixed;z-index:3;right:16px;bottom:16px;width:min(390px,calc(100vw - 32px));display:flex;align-items:flex-start;gap:12px;padding:12px;background:var(--card);color:var(--fg);border:1px solid var(--line);border-inline-start:3px solid var(--acc);border-radius:8px;box-shadow:0 10px 25px #0003}
+#toast[hidden]{display:none}
+#toast[data-error="true"]{border-inline-start-color:var(--bad)}
+#toast-message{flex:1;align-self:center;min-width:0;overflow-wrap:anywhere}
+#dismiss-toast{padding:3px 10px}
+.panel-dialog{width:min(480px,calc(100vw - 32px));max-height:calc(100dvh - 32px);overflow:auto;padding:0;background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:12px;box-shadow:0 16px 48px #0004}
+.panel-dialog::backdrop{background:#090f1c99}
+.panel-dialog form{padding:20px}
+.panel-dialog h2{font-size:18px;margin:0 0 8px}
+.panel-dialog p{margin:0 0 16px;overflow-wrap:anywhere}
+.dialog-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px;padding-top:14px;margin-top:14px;border-top:1px solid var(--line)}
+.dialog-form label{display:block;font-weight:600;margin-top:12px}
+.dialog-form input{display:block;width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:7px;padding:8px 10px;margin-top:4px;font:inherit}
+@media(prefers-color-scheme:dark){.panel-dialog .b:not(.g):not(.r){color:#121b2a}}
 .empty{padding:30px;text-align:center;color:var(--mut)}
+.diagnostic-card{margin-top:16px}
+.tool-schema{max-height:22rem;overflow:auto;padding:12px;background:var(--code);border-radius:6px;white-space:pre-wrap;overflow-wrap:anywhere}
+.diagnostic-table{overflow:auto;max-height:24rem}
+.diagnostic-table table{width:100%;border-collapse:collapse;text-align:left}
+.diagnostic-table th,.diagnostic-table td{padding:8px;border-bottom:1px solid var(--line);vertical-align:top}
+.diagnostic-table th{position:sticky;top:0;background:var(--card)}
+.diagnostic-table td:first-child,.diagnostic-table td:nth-child(4){white-space:nowrap}
+#desktop-sessions>.row{align-items:flex-start}
+#desktop-sessions summary{margin-top:6px;cursor:pointer;color:var(--acc)}
+#desktop-sessions details p{margin:6px 0}
+.desktop-session-buttons{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+#tool-choice{max-width:100%}
+#tool-arguments{display:block;width:100%;min-height:5rem;resize:vertical;margin:4px 0 10px;padding:8px;background:var(--code);color:var(--fg);border:1px solid var(--line);border-radius:6px}
+.diagnostic-table button{margin-top:4px;padding:3px 7px}
 </style></head><body>
-<header><div id="dot"></div><h1>PC Bridge <span id="ver" class="mut small"></span></h1><div id="head"></div>
-<nav><button data-t="ov" class="on">Обзор</button><button data-t="feed">Лента действий</button><button data-t="chg">Изменения файлов</button></nav></header>
+<header><div id="dot" aria-hidden="true"></div><h1>PC Bridge <span id="ver" class="mut small"></span></h1><div id="head" role="status"></div></header>
+<div class="workbench">
+<nav aria-label="Разделы панели">
+  <button type="button" data-t="ov" class="on" aria-current="page">Обзор</button>
+  <button type="button" data-t="work">Работа</button>
+  <button type="button" data-t="connections">Подключения</button>
+  <button type="button" data-t="extensions">Расширения</button>
+  <button type="button" data-t="feed">Лента действий</button>
+  <button type="button" data-t="chg">Изменения файлов</button>
+  <button type="button" data-t="security">Безопасность</button>
+  <button type="button" data-t="diagnostics">Диагностика</button>
+  <button type="button" data-t="settings">Настройки</button>
+</nav>
 <main>
-<section id="ov" class="tab on"><div class="grid">
- <div class="card"><h2>Состояние</h2>
-  <div class="row"><div class="l">Мост</div><div id="st" class="mut"></div></div>
-  <div class="row"><div class="l">Notion-агент подключался</div><div id="lc" class="mut"></div></div>
-  <div class="row"><div class="l">Сейчас</div><div id="act" class="mut"></div></div>
-  <div class="row" style="gap:6px;flex-wrap:wrap"><button class="b g" onclick="A('restart')">Перезапустить мост</button>
-  <button class="b g" onclick="A('console')">Консоль</button><button class="b g" onclick="A('open',{target:'workspace'})">Рабочая папка</button>
-  <button class="b g" onclick="A('open',{target:'logs'})">Логи</button><button class="b r" onclick="stopAll()">Остановить всё</button></div></div>
- <div class="card"><h2>Подключение к Notion</h2>
-  <div class="mut small">Адрес MCP-сервера</div><div class="field"><code id="url">-</code><button class="b g" onclick="cp('url')">Копировать</button></div>
-  <div id="tokbox"><div class="mut small">Токен (Authorization: Bearer)</div><div class="field"><code id="tok">••••••••</code>
-  <button class="b g" onclick="showTok=!showTok;draw()">Показать</button><button class="b g" onclick="cp('token')">Копировать</button></div></div>
-  <div style="display:flex;gap:10px;align-items:center"><button class="b" id="chk" onclick="check()">Проверить подключение</button><span id="chkt" class="mut small"></span></div>
-  <div id="steps" style="margin-top:8px"></div></div>
- <div class="card"><h2>Аккаунты ngrok</h2><p class="mut small">При ошибке лимита трафика мост переключится на следующий добавленный аккаунт. Адрес MCP может измениться: скопируйте его заново в Notion. Токены хранятся открытым текстом в ngrok_accounts.json.</p><div id="accounts"></div><button class="b g" onclick="addAccount()">Добавить аккаунт</button></div>
- <div class="card"><h2>Режимы</h2><div id="modes"></div></div>
- <div class="card"><h2>Модули <span class="mut small">(переключение перезапускает мост)</span></h2><div id="mods"></div>
-  <div class="row"><div class="l mut small">Остальные настройки - в мастере</div><button class="b g" onclick="A('settings')">Все настройки...</button></div></div>
-</div></section>
+<section id="ov" class="tab on"><h2>Обзор</h2>
+ <div class="grid">
+  <div class="card"><h3>Состояние</h3>
+   <div class="row"><div class="l">Мост</div><div id="st" class="mut"></div></div>
+   <div class="row"><div class="l">Последнее подключение</div><div id="lc" class="mut"></div></div>
+   <div class="row"><div class="l">Текущий вызов</div><div id="act" class="mut"></div></div>
+  </div>
+  <div class="card"><h3>Управление мостом</h3><div class="tools">
+   <button class="b g" onclick="A('restart')">Перезапустить</button>
+   <button class="b g" onclick="A('open',{target:'workspace'})">Рабочая папка</button>
+   <button class="b r" onclick="stopAll()">Остановить</button>
+  </div></div>
+ </div>
+</section>
+<section id="work" class="tab"><h2>Работа</h2>
+ <div class="grid">
+  <div class="card"><h3>Computer Use</h3><div id="automation"></div></div>
+  <div class="card"><h3>Сессии браузера</h3><div id="sessions">Загрузка…</div>
+   <button class="b g" onclick="loadSessions()">Обновить</button>
+  </div>
+  <div class="card"><h3>Фоновые задачи</h3>
+   <div id="job-list">Загрузка…</div>
+   <button class="b g" id="refresh-jobs" type="button">Обновить</button>
+   <span id="job-count" class="mut small" role="status"></span>
+  </div>
+  <div class="card"><h3>Фоновые приложения Windows</h3><div id="desktop-sessions">Загрузка…</div>
+   <button class="b g" onclick="loadDesktops()">Обновить</button>
+  </div>
+ </div>
+</section>
+<section id="connections" class="tab"><h2>Подключения</h2>
+ <div class="connection-grid">
+  <div class="card">
+   <h3>Адрес MCP</h3>
+   <div class="field"><code id="url">—</code><div class="field-actions">
+    <button type="button" class="b g" id="copy-url" aria-label="Копировать адрес MCP" onclick="cp('url')" disabled>Копировать</button>
+   </div></div>
+   <div id="tokbox" hidden>
+    <span class="connection-label mut small">Токен владельца (Bearer)</span>
+    <div class="field"><code id="tok">••••••••</code><div class="field-actions">
+     <button type="button" class="b g" id="show-token" aria-controls="tok" onclick="showTok=!showTok;drawConnectionFields()">Показать</button>
+     <button type="button" class="b g" id="copy-token" aria-label="Копировать токен владельца" onclick="cp('token')">Копировать</button>
+    </div></div>
+   </div>
+  </div>
+  <div class="card">
+   <h3>Аккаунты ngrok</h3>
+   <div id="accounts"></div>
+   <div class="account-footer"><button type="button" class="b g" onclick="addAccount()">Добавить аккаунт</button></div>
+  </div>
+ </div>
+</section>
+<section id="extensions" class="tab"><h2>Расширения</h2>
+ <div class="grid">
+  <div class="card"><h3>Skills</h3><div id="skills"></div></div>
+  <div class="card"><h3>Плагины</h3><div id="plugins"></div></div>
+ </div>
+</section>
+<section id="security" class="tab"><h2>Безопасность</h2>
+ <div class="grid">
+  <div class="card"><h3>Доступ</h3><div id="modes"></div></div>
+  <div class="card"><h3>Зарегистрированные OAuth-клиенты</h3><div id="oauth-clients"></div></div>
+ </div>
+</section>
+<section id="diagnostics" class="tab"><h2>Диагностика</h2>
+ <div class="card"><h3>Проверка подключения</h3>
+  <div class="tools"><button class="b" id="chk" onclick="check()">Запустить проверку</button>
+   <button class="b g" onclick="A('console')">Консоль</button>
+   <button class="b g" onclick="A('open',{target:'logs'})">Папка логов</button><span id="chkt" class="mut small" role="status"></span>
+  </div><div id="steps"></div>
+ </div>
+ <div class="card diagnostic-card">
+  <h3>Инструменты MCP</h3>
+  <div class="tools">
+   <input id="tool-search" type="search" placeholder="Поиск по имени или описанию" aria-label="Поиск инструментов MCP">
+   <button class="b g" id="refresh-tools">Обновить список</button>
+  </div>
+  <label for="tool-choice">Инструмент</label>
+  <select id="tool-choice" disabled><option value="">Загрузка…</option></select>
+  <p id="tool-description" class="mut" role="status"></p>
+  <pre id="tool-schema" class="tool-schema" hidden></pre>
+  <form id="tool-replay" autocomplete="off" hidden>
+   <label for="tool-arguments">Аргументы (JSON)</label>
+   <textarea id="tool-arguments" class="mono" maxlength="16000" spellcheck="false" autocapitalize="off" aria-describedby="tool-replay-help"></textarea>
+   <p id="tool-replay-help" class="mut small">Введите аргументы заново. В журнал записываются только метаданные вызова.</p>
+   <div class="tools">
+    <button class="b" id="run-tool" type="submit">Выполнить пробный вызов</button>
+    <span id="tool-replay-status" class="mut small" role="status"></span>
+   </div>
+   <pre id="tool-result" class="tool-schema" aria-label="Ответ MCP" hidden></pre>
+  </form>
+ </div>
+ <div class="card diagnostic-card">
+  <h3>Недавние вызовы</h3>
+  <div class="tools">
+   <select id="diagnostic-filter" aria-label="Фильтр результатов"><option value="">Все</option><option value="error">Ошибки</option></select>
+   <button class="b g" id="refresh-diagnostics">Обновить</button>
+   <button class="b g" id="export-diagnostics">Скачать JSON</button>
+  </div>
+  <p id="diagnostic-status" class="mut" role="status"></p>
+  <div class="diagnostic-table" id="diagnostic-table" hidden>
+   <table aria-label="Недавние вызовы MCP">
+    <thead><tr><th scope="col">Время</th><th scope="col">Инструмент</th><th scope="col">Результат</th><th scope="col">Длительность</th><th scope="col">ID вызова</th></tr></thead>
+    <tbody id="diagnostic-events"></tbody>
+   </table>
+  </div>
+ </div>
+</section>
+<section id="settings" class="tab"><h2>Настройки</h2>
+ <div class="grid">
+  <div class="card"><h3>Модули</h3><div id="mods"></div></div>
+  <div class="card"><h3>Windows</h3><div id="desktop-settings"></div><button class="b g" onclick="A('settings')">Открыть мастер настроек</button></div>
+ </div>
+</section>
 <section id="feedtab" class="tab"><div class="tools"><input type="search" id="q" placeholder="Поиск по ленте: файл, команда, ошибка...">
 <select id="mod"><option value="">Все модули</option></select><select id="kind"><option value="">Все события</option><option value="chg">Только изменения</option>
 <option value="err">Только ошибки</option><option value="warn">Опасные и запрещённые</option></select>
@@ -81,36 +242,198 @@ tr.skip td{background:var(--code);color:var(--mut);text-align:center;font-size:1
 <div class="tools"><input type="search" id="cq" placeholder="Поиск по имени файла..."><button class="b r" id="ubtn" onclick="undoSel()" disabled>Отменить выбранные</button>
 <span class="mut small">Отмена возвращает файлы к состоянию до изменения и сама тоже отменяется.</span></div>
 <div class="split"><div id="clist"></div><div id="diff"><div class="empty">Выберите изменение слева</div></div></div></section>
-</main><div id="toast"></div>
+</main></div>
+<div id="toast" hidden>
+ <span id="toast-message" role="status"></span>
+ <button type="button" class="b g" id="dismiss-toast" aria-label="Закрыть уведомление">×</button>
+</div>
+<dialog class="panel-dialog" id="confirmation" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+ <form method="dialog">
+  <h2 id="confirm-title"></h2>
+  <p id="confirm-message" class="mut"></p>
+  <div class="dialog-actions">
+   <button class="b g" value="cancel" autofocus>Отмена</button>
+   <button class="b r" value="confirm" id="confirm-action"></button>
+  </div>
+ </form>
+</dialog>
+<dialog class="panel-dialog" id="account-dialog" aria-labelledby="account-title">
+ <form method="dialog" class="dialog-form">
+  <h2 id="account-title">Добавить аккаунт ngrok</h2>
+  <label>Имя<input name="name" required maxlength="80" autocomplete="off" autofocus></label>
+  <label>Authtoken<input name="token" type="password" required autocomplete="off"></label>
+  <label>Домен <span class="mut small">(необязательно)</span><input name="domain" autocomplete="off"></label>
+  <div class="dialog-actions">
+   <button class="b g" value="cancel" formnovalidate>Отмена</button>
+   <button class="b" value="add">Добавить</button>
+  </div>
+ </form>
+</dialog>
 <script>
 const K="__KEY__";let S=null,showTok=false,feedPos=-1,blocks=[],changes=[],sel=new Set(),cur=null;
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 async function api(p,body){const r=await fetch(p,{method:body?"POST":"GET",headers:{"X-PCB-Panel":K,"Content-Type":"application/json"},body:body?JSON.stringify(body):undefined});return r.json()}
-function toast(t){const e=$("toast");e.textContent=t;e.style.display="block";clearTimeout(e._t);e._t=setTimeout(()=>e.style.display="none",3500)}
-async function A(d,x){const r=await api("/api/action",Object.assign({do:d},x||{}));if(r.error)toast(r.error);setTimeout(load,400);return r}
-function stopAll(){if(confirm("Остановить PC Bridge полностью? Панель тоже закроется."))A("stop")}
-async function cp(w){const v=w=="url"?S.url:S.token;try{await navigator.clipboard.writeText(v)}catch(e){await A("copy",{what:w})}toast("Скопировано")}
-function sw(on,fn,dis){return `<label class="sw"><input type="checkbox" ${on?"checked":""} ${dis?"disabled":""} onchange="${fn}"><span></span></label>`}
-async function addAccount(){const name=prompt("Имя аккаунта ngrok:");if(!name)return;const token=prompt("Authtoken аккаунта ngrok:");if(!token)return;const domain=prompt("Домен этого аккаунта (необязательно):","");if(domain===null)return;await A("ngrok_add",{name,token,domain});load()}
-async function selectAccount(name){await A("ngrok_select",{name});toast("Переключаю туннель. Адрес MCP может измениться.")}
-async function deleteAccount(name){if(confirm("Удалить аккаунт «"+name+"»?"))await A("ngrok_delete",{name})}
+let toastTimer;
+function hideToast(){
+  clearTimeout(toastTimer);
+  $("toast").hidden=true;
+  $("toast-message").textContent="";
+}
+$("dismiss-toast").onclick=hideToast;
+function toast(message,error=false){
+  clearTimeout(toastTimer);
+  const notice=$("toast");
+  notice.dataset.error=String(error);
+  notice.hidden=false;
+  $("toast-message").textContent=message;
+  if(!error)toastTimer=setTimeout(hideToast,5500);
+}
+function dialogChoice(dialog){
+  dialog.returnValue="";
+  return new Promise(resolve=>{
+    dialog.addEventListener("close",()=>resolve(dialog.returnValue),{once:true});
+    dialog.showModal();
+  });
+}
+async function confirmAction(title,message,action){
+  const dialog=$("confirmation");
+  if(document.querySelector(".panel-dialog[open]"))return false;
+  $("confirm-title").textContent=title;
+  $("confirm-message").textContent=message;
+  $("confirm-action").textContent=action;
+  return (await dialogChoice(dialog))==="confirm";
+}
+async function A(d,x){
+  const r=await api("/api/action",Object.assign({do:d},x||{}));
+  if(r.error)toast(r.error,true);
+  setTimeout(load,400);
+  return r;
+}
+async function stopAll(){
+  if(await confirmAction("Остановить PC Bridge?","Работа моста прекратится, панель закроется.","Остановить"))await A("stop");
+}
+async function cp(what){
+  const value=what==="url"?S?.url:S?.token;
+  if(!value)return;
+  try{
+    await navigator.clipboard.writeText(value);
+  }catch{
+    try{
+      const result=await A("copy",{what});
+      if(!result.ok)return;
+    }catch{
+      toast("Не удалось скопировать",true);
+      return;
+    }
+  }
+  toast(what==="url"?"Адрес MCP скопирован":"Токен скопирован");
+}
+function sw(on,fn,dis,label){return `<label class="sw"><input type="checkbox" aria-label="${esc(label)}" ${on?"checked":""} ${dis?"disabled":""} onchange="${fn}"><span></span></label>`}
+function drawIfChanged(id,markup){
+  const node=$(id);
+  if(node.dataset.rendered!==markup){node.innerHTML=markup;node.dataset.rendered=markup}
+}
+async function addAccount(){
+  const dialog=$("account-dialog");
+  if(document.querySelector(".panel-dialog[open]"))return;
+  const form=dialog.querySelector("form");
+  const choice=await dialogChoice(dialog);
+  const values=Object.fromEntries(new FormData(form));
+  form.reset();
+  if(choice==="add")await A("ngrok_add",values);
+}
+async function selectAccount(name){
+  const result=await A("ngrok_select",{name});
+  if(result.ok)toast("Переключаю туннель. Адрес MCP может измениться.");
+}
+async function deleteAccount(name){
+  if(await confirmAction("Удалить аккаунт ngrok?","Аккаунт «"+name+"» будет удалён из PC Bridge.","Удалить"))
+    await A("ngrok_delete",{name});
+}
+function drawConnectionFields(){
+  const url=S.url||"Туннель ещё не запущен";
+  if(!S.token_auth||!S.token)showTok=false;
+  const token=showTok?S.token:"•".repeat(24);
+  if($("url").textContent!==url)$("url").textContent=url;
+  if($("tok").textContent!==token)$("tok").textContent=token;
+  $("copy-url").disabled=!S.url;
+  $("tokbox").hidden=!S.token_auth;
+  $("show-token").disabled=$("copy-token").disabled=!S.token;
+  $("show-token").textContent=showTok?"Скрыть":"Показать";
+}
+
+const DEFAULT_ACCOUNT="По умолчанию";
+let renderedAccounts="";
+function drawAccounts(){
+  const accounts=[{name:DEFAULT_ACCOUNT},...(S.ngrok_accounts||[])];
+  const active=S.ngrok_active||DEFAULT_ACCOUNT;
+  const signature=JSON.stringify([active,accounts]);
+  if(signature===renderedAccounts)return;
+  renderedAccounts=signature;
+  $("accounts").replaceChildren(...accounts.map(account=>{
+    const row=document.createElement("div");
+    row.className="account-row";
+    const label=document.createElement("div");
+    label.className="account-label";
+    label.textContent=account.name;
+    if(account.domain){
+      const domain=document.createElement("span");
+      domain.className="account-domain mut small";
+      domain.textContent=account.domain;
+      label.append(domain);
+    }
+    const actions=document.createElement("div");
+    actions.className="account-actions";
+    if(account.name===active){
+      const status=document.createElement("span");
+      status.className="account-active";
+      status.textContent="Активный";
+      actions.append(status);
+    }else{
+      actions.append(accountButton("Выбрать",account.name,selectAccount));
+      if(account.name!==DEFAULT_ACCOUNT)actions.append(accountButton("Удалить",account.name,deleteAccount));
+    }
+    row.append(label,actions);
+    return row;
+  }));
+}
+function accountButton(text,name,action){
+  const button=document.createElement("button");
+  button.type="button";
+  button.className="b g";
+  button.textContent=text;
+  button.setAttribute("aria-label",text+" аккаунт "+name);
+  button.onclick=()=>action(name);
+  return button;
+}
+
 function draw(){if(!S)return;$("dot").style.background=S.color;$("dot").className=S.running?"blink":"";$("ver").textContent=S.version;
 $("head").textContent=S.headline;$("st").textContent=S.status;$("lc").textContent=S.last_call_text;$("act").textContent=S.running?("работает: "+S.last_tool):(S.activity||"ничего не делает");
-$("url").textContent=S.url||"туннель ещё не запущен";$("tokbox").style.display=S.token_auth?"":"none";$("tok").textContent=showTok?S.token:"•".repeat(24);
-const accounts=[{name:"По умолчанию"},...(S.ngrok_accounts||[])];$("accounts").replaceChildren(...accounts.map(x=>{const row=document.createElement("div");row.className="row";const label=document.createElement("div");label.className="l";label.textContent=x.name+(x.domain?" · "+x.domain:"");row.append(label);const active=(S.ngrok_active||"По умолчанию")==x.name;const b=document.createElement("button");b.className="b g";b.textContent=active?"Выбран":"Выбрать";b.disabled=active;b.onclick=()=>selectAccount(x.name);row.append(b);if(x.name!="По умолчанию"){const del=document.createElement("button");del.className="b g";del.textContent="Удалить";del.disabled=active;del.onclick=()=>deleteAccount(x.name);row.append(del)}return row}));
+drawConnectionFields();
+drawAccounts();
 const m=[["Пауза (Ctrl+Alt+Shift+P)","агент ничего не может делать",S.paused,"A('pause')"],["Только чтение",S.read_only_fixed?"задано в настройках":"агент смотрит, но ничего не меняет",S.read_only,"A('readonly')",S.read_only_fixed],
 ["Уведомления Windows","с кнопками «Показать» и «Отменить»",S.notifications,"A('notifications')"],["Автозапуск с Windows","",S.autostart,"A('autostart')"]];
-$("modes").innerHTML=m.map(x=>`<div class="row"><div class="l">${x[0]}<div class="mut small">${x[1]}</div></div>${sw(x[2],x[3],x[4])}</div>`).join("");
-$("mods").innerHTML=S.modules.map(x=>`<div class="row"><div class="l">${esc(x.name)}${x.risky?' <span class="badge">осторожно</span>':""}</div>${sw(x.on,`mod('${x.key}',this.checked,${x.risky})`)}</div>`).join("");
+const modeRow=x=>`<div class="row"><div class="l">${x[0]}<div class="mut small">${x[1]}</div></div>${sw(x[2],x[3],x[4],x[0])}</div>`;
+drawIfChanged("modes",m.slice(0,2).map(modeRow).join(""));
+drawIfChanged("desktop-settings",m.slice(2).map(modeRow).join(""));
+drawIfChanged("mods",S.modules.map(x=>`<div class="row"><div class="l">${esc(x.name)}${x.risky?' <span class="badge">осторожно</span>':""}</div>${sw(x.on,`mod('${x.key}',this,${x.risky})`,false,x.name)}</div>`).join(""));
 const cu=S.computer_use;if(cu){const row=document.createElement("div");row.className="mut small";
 row.textContent=[cu.uia?"UIA":null,cu.playwright?"Playwright":null,cu.visual?"Визуальный ввод и OCR":null,
 cu.dxgi==="available"?"DXGI":cu.dxgi==="missing"?"DXGI: пакет не установлен":null,
 cu.adapter==="configured"?"Vision: настроен":cu.adapter==="missing"?"Vision: отсутствует скрипт":null,
-cu.last_operation?.status?"Ввод: "+cu.last_operation.status+(cu.last_operation.error_code?" ("+cu.last_operation.error_code+")":""):null].filter(Boolean).join(" · ");$("mods").append(row)}
+cu.last_operation?.status?"Ввод: "+cu.last_operation.status+(cu.last_operation.error_code?" ("+cu.last_operation.error_code+")":""):null].filter(Boolean).join(" · ");$("automation").replaceChildren(row)}
 const c=S.check;if(c&&c.steps&&c.steps.length){$("chkt").textContent=c.running?"проверяю...":(c.ok?"всё в порядке, ":"есть проблема, ")+"проверено "+new Date(c.t*1000).toLocaleTimeString();
 $("steps").innerHTML=c.steps.map(s=>`<div class="step"><div class="i ${s.ok?"ok":"bad"}">${s.ok?"✓":"✗"}</div><div style="flex:1"><b>${esc(s.name)}</b> <span class="mut">${esc(s.detail)}</span>${s.fix?`<div class="fix">${esc(s.fix)}</div>`:""}</div></div>`).join("")}}
-function mod(k,on,risky){if(on&&risky&&!confirm("Этот модуль даёт агенту больше власти над ПК. Включить и перезапустить мост?")){load();return}A("module",{key:k,on:on});toast("Перезапускаю мост...")}
+async function mod(key,input,risky){
+  const on=input.checked;
+  if(on&&risky&&!(await confirmAction("Включить модуль?","После перезапуска агент получит дополнительные возможности на ПК.","Включить"))){
+    input.checked=false;
+    return;
+  }
+  const result=await A("module",{key,on});
+  if(result.ok)toast("Перезапускаю мост…");
+}
 async function check(){$("chk").disabled=true;$("chkt").textContent="проверяю...";$("steps").innerHTML="";try{S.check=await api("/api/check",{});draw()}finally{$("chk").disabled=false}}
 async function load(){try{S=await api("/api/state");draw()}catch(e){$("head").textContent="Панель не отвечает - PC Bridge остановлен?";$("dot").style.background="#999"}}
 // ---- feed ----
@@ -152,18 +475,335 @@ h+=`<div class="fh"><span style="flex:1" title="${esc(f.path)}">${esc(f.name)} <
 if(f.note){h+=`<div class="empty">${esc(f.note)}</div>`;continue}if(!f.rows.length){h+='<div class="empty">Содержимое не изменилось</div>';continue}
 h+='<table class="d">'+f.rows.map(x=>x.t=="skip"?'<tr class="skip"><td colspan="4">⋯</td></tr>':`<tr class="${x.t}"><td class="n">${x.ln??""}</td><td class="c L">${esc(x.l??"")}</td><td class="n">${x.rn??""}</td><td class="c R">${esc(x.r??"")}</td></tr>`).join("")+"</table>"}
 $("diff").innerHTML=h+(r.files&&r.files.length?"":'<div class="empty">Нет данных об этом изменении</div>')}
-async function undoIds(ids){if(!confirm(`Отменить ${ids.length} изменение(й)? Файлы вернутся к состоянию до них.`))return;
-const r=await api("/api/undo",{ids});if(r.error)toast("Не удалось: "+r.error);else toast(`Отменено: ${(r.done||[]).length}`+((r.failed||[]).length?`, ошибок: ${r.failed.length} (${r.failed[0].error})`:""));
+async function undoIds(ids){
+if(!(await confirmAction("Отменить изменения файлов?",`Выбрано изменений: ${ids.length}. Файлы вернутся к предыдущему состоянию.`,"Отменить изменения")))return;
+const r=await api("/api/undo",{ids});if(r.error)toast("Не удалось: "+r.error,true);else toast(`Отменено: ${(r.done||[]).length}`+((r.failed||[]).length?`, ошибок: ${r.failed.length} (${r.failed[0].error})`:""));
 sel.clear();hideBanner();await loadChanges();if(cur)openChange(cur)}
 function undoSel(){if(sel.size)undoIds([...sel])}
 function hideBanner(){$("banner").style.display="none"}
 // ---- tabs and links from notifications ----
-function tab(t){document.querySelectorAll("nav button").forEach(b=>b.classList.toggle("on",b.dataset.t==t));
-[["ov","ov"],["feed","feedtab"],["chg","chg"]].forEach(([k,id])=>$(id).classList.toggle("on",k==t));if(t=="feed")drawFeed();if(t=="chg")loadChanges()}
+function row(label,detail,button,action){
+  const element=document.createElement("div");element.className="row";
+  const body=document.createElement("div");body.className="l";body.textContent=label;element.append(body);
+  if(detail){const hint=document.createElement("div");hint.className="mut small";hint.textContent=detail;body.append(hint)}
+  if(button){const control=document.createElement("button");control.type="button";control.className="b g";control.textContent=button;control.onclick=action;element.append(control)}
+  return element;
+}
+async function loadClients(){
+  const data=await api("/api/oauth-clients");const list=data.clients||[];
+  $("oauth-clients").replaceChildren(...(list.length?list.map(client=>row(client.name,client.id,"Отозвать",async()=>{
+    if(await confirmAction("Отозвать доступ?","Клиент «"+client.name+"» потеряет доступ к PC Bridge.","Отозвать")){
+      await A("oauth_revoke",{client_id:client.id});await loadClients();
+    }
+  })):[row("Клиентов пока нет")]));
+}
+async function loadExtensions(){
+  const data=await api("/api/extensions");
+  for(const [kind,id] of [["skill","skills"],["plugin","plugins"]]){
+    const entries=data[kind]||[];
+    $(id).replaceChildren(...(entries.length?entries.map(ext=>row(ext.name,
+      [ext.description,ext.unsupported?.length?"Неподдерживаемые компоненты: "+ext.unsupported.join(", "):""].filter(Boolean).join(" · "),
+      ext.enabled?"Отключить":"Включить",async()=>{
+        await A("extension_enable",{kind,name:ext.name,enabled:!ext.enabled});await loadExtensions();
+      })):[row("Расширений пока нет")]));
+  }
+}
+function ownerLabel(owner){return owner==="owner"?"Владелец":owner}
+async function applyWorkAction(button,path,body,prompt,refresh){
+  if(!(await confirmAction("Подтвердите действие",prompt,button.textContent)))return;
+  button.disabled=true;
+  try{
+    const result=await api(path,body);
+    if(result.error)toast(result.error,true);
+    await refresh();
+  }catch{
+    toast("Не удалось получить ответ. Обновите список перед повтором.",true);
+  }finally{
+    button.disabled=false;
+  }
+}
+async function loadSessions(){
+  const data=await api("/api/sessions");
+  const entries=data.sessions||[];
+  $("sessions").replaceChildren(...(entries.length?entries.map(session=>{
+    const {session_id,owner,pages,snapshots,headless}=session;
+    const detail=[ownerLabel(owner),headless?"Без физического ввода":"Может менять фокус",
+      "Вкладок "+pages,"Снимков "+snapshots].join(" · ");
+    return row(session_id,detail,"Закрыть",event=>applyWorkAction(event.currentTarget,
+      "/api/browser-session-close",{session_id,owner},"Закрыть сессию Chromium и её вкладки?",loadSessions));
+  }):[row(data.error||"Активных сессий нет")]));
+}
+async function loadJobs(){
+  const button=$("refresh-jobs"), count=$("job-count"), list=$("job-list");
+  if(button.disabled)return;
+  button.disabled=true;
+  try{
+    const data=await api("/api/jobs");
+    const jobs=data.jobs||[];
+    const states={running:"Выполняется",completed:"Завершена",failed:"Ошибка",stopped:"Остановлена",unknown:"Исход неизвестен"};
+    list.replaceChildren(...(jobs.length?jobs.map(job=>{
+      const {job_id,status,owner,started,exit_code,recovered}=job;
+      const detail=[states[status]||status,ownerLabel(owner),new Date(started*1000).toLocaleString(),
+        exit_code==null?"":"Код "+exit_code,recovered?"Восстановлена после перезапуска":""].filter(Boolean).join(" · ");
+      return row(job_id,detail,status==="running"?"Остановить":null,event=>applyWorkAction(event.currentTarget,
+        "/api/job-stop",{job_id},"Остановить задачу и её дочерние процессы?",loadJobs));
+    }):[row(data.error||"Фоновых задач нет")]));
+    count.textContent=data.total>jobs.length?"Показано "+jobs.length+" из "+data.total:"";
+  }catch{
+    count.textContent="История задач недоступна";
+  }finally{
+    button.disabled=false;
+  }
+}
+$("refresh-jobs").onclick=loadJobs;
+function desktopOperationStatus(operation){
+  if(operation.status==="running")return "Выполняется";
+  if(operation.outcome==="unknown")return "Исход неизвестен";
+  if(operation.outcome==="rejected")return "Отклонено";
+  return {verified:"Результат подтверждён",not_observed:"Результат не обнаружен",
+    unavailable:"Проверка недоступна",not_requested:"Выполнено без проверки"}[operation.verification_status]
+    ||"Исход неизвестен";
+}
+function desktopOperationHistory(session, expanded){
+  const details=document.createElement("details");
+  details.dataset.sessionId=session.session_id;
+  details.open=expanded;
+  const summary=document.createElement("summary");
+  const history=session.operations;
+  summary.textContent=history.length<session.operation_count?
+    `Действия · последние ${history.length} из ${session.operation_count}`:`Действия · ${history.length}`;
+  const id=document.createElement("p");
+  id.className="mut small";
+  id.textContent="ID сессии "+session.session_id;
+  details.append(summary,id);
+  for(const operation of history){
+    const description=[desktopOperationStatus(operation),operation.action,
+      new Date(operation.started_at*1000).toLocaleString(),operation.error_code].filter(Boolean).join(" · ");
+    details.append(row(operation.operation_id,description));
+  }
+  return details;
+}
+async function loadDesktops(){
+  const data=await api("/api/desktop-sessions");
+  const list=$("desktop-sessions");
+  const expanded=new Set(Array.from(list.querySelectorAll("details[open]"),node=>node.dataset.sessionId));
+  const rows=(data.sessions||[]).map(session=>{
+    const states={starting:"Запуск",ready:"Работает",exited:"Приложение завершилось",lost:"Завершена аварийно"};
+    const finished=session.state==="exited"||session.state==="lost";
+    const inputStatus=session.state==="ready"&&session.input_paused?"Ввод на паузе":"";
+    const entry=row(session.app,[states[session.state],inputStatus,ownerLabel(session.owner),
+      "Win32 Desktop · Экспериментально"].filter(Boolean).join(" · "),
+      finished?"Убрать из списка":"Закрыть",async()=>{
+        if(!finished&&!(await confirmAction("Закрыть приложение?","Его фоновые процессы тоже завершатся.","Закрыть")))return;
+        const result=await api("/api/desktop-session-close",{session_id:session.session_id});
+        if(result.error)toast(result.error,true);
+        await loadDesktops();
+      });
+    const content=entry.querySelector(".l");
+    const controls=document.createElement("div");
+    controls.className="desktop-session-buttons";
+    controls.append(entry.lastElementChild);
+    if(data.input_enabled&&session.state==="ready"){
+      const control=document.createElement("button");
+      control.type="button";control.className="b g";
+      control.textContent=session.input_paused?"Возобновить ввод":"Приостановить ввод";
+      control.onclick=async()=>{
+        control.disabled=true;
+        try{
+          const result=await api("/api/desktop-session-input",{session_id:session.session_id,paused:!session.input_paused});
+          if(result.error)toast(result.error,true);
+          await loadDesktops();
+        }catch{
+          toast("Не удалось обновить режим ввода",true);
+        }finally{
+          control.disabled=false;
+        }
+      };
+      controls.prepend(control);
+    }
+    content.append(controls);
+    if(session.operations?.length)content.append(desktopOperationHistory(session,expanded.has(session.session_id)));
+    return entry;
+  });
+  list.replaceChildren(...(rows.length?rows:[row(data.error||(data.enabled?"Активных сессий нет":"Режим выключен"))]));
+}
+let toolCatalog=[], diagnosticEvents=[], diagnosticError="";
+let replayTool=null, replayRunning=false;
+function showToolSchema(){
+  const tool=toolCatalog.find(item=>item.name===$("tool-choice").value);
+  $("tool-description").textContent=tool?
+    [tool.read_only?"Доступен в режиме чтения":"Требует доступа на запись",tool.description].filter(Boolean).join(" · "):"";
+  $("tool-schema").hidden=!tool;
+  $("tool-schema").textContent=tool?JSON.stringify({
+    inputSchema:tool.inputSchema,...(tool.outputSchema?{outputSchema:tool.outputSchema}:{})
+  },null,2):"";
+  $("tool-replay").hidden=!tool?.replayable;
+  const name=tool?.name;
+  if(replayTool?.name!==name){
+    replayTool={name};
+    $("tool-arguments").value="{}";
+    $("tool-replay-status").textContent="";
+    $("tool-result").textContent="";
+    $("tool-result").hidden=true;
+  }
+}
+async function runTool(event){
+  event.preventDefault();
+  const selection=replayTool;
+  if(replayRunning||!toolCatalog.some(tool=>tool.name===selection?.name&&tool.replayable))return;
+  const status=$("tool-replay-status"), result=$("tool-result"), button=$("run-tool");
+  result.hidden=true;
+  result.textContent="";
+  let args;
+  try{
+    args=JSON.parse($("tool-arguments").value);
+    if(!args||typeof args!=="object"||Array.isArray(args))throw new Error();
+  }catch{
+    status.textContent="Введите корректный объект JSON";
+    return;
+  }
+  replayRunning=true;
+  button.disabled=true;
+  status.textContent="Выполняется…";
+  try{
+    const response=await api("/api/diagnostic-replay",{name:selection.name,arguments:args});
+    if(selection===replayTool){
+      status.textContent=response.error||response.result?.error||"Вызов завершён";
+      if(response.result){
+        result.textContent=JSON.stringify(response.result,null,2);
+        result.hidden=false;
+      }
+    }
+    loadDiagnosticEvents();
+  }catch{
+    if(selection===replayTool)status.textContent="Не удалось получить ответ";
+  }finally{
+    replayRunning=false;
+    button.disabled=false;
+  }
+}
+function prepareReplay(name){
+  $("tool-search").value=name;
+  filterTools();
+  $("tool-choice").value=name;
+  replayTool=null;
+  showToolSchema();
+  $("tool-arguments").focus();
+}
+function filterTools(message){
+  const query=$("tool-search").value.trim().toLowerCase();
+  const select=$("tool-choice"), before=select.value;
+  const matches=toolCatalog.filter(tool=>[tool.name,tool.description].join(" ").toLowerCase().includes(query));
+  select.replaceChildren(...(matches.length?matches.map(tool=>new Option(tool.name,tool.name)):
+    [new Option(message||"Инструменты не найдены","")]));
+  select.disabled=!matches.length;
+  if(matches.some(tool=>tool.name===before))select.value=before;
+  showToolSchema();
+}
+async function loadToolCatalog(){
+  const button=$("refresh-tools");
+  if(button.disabled)return;
+  button.disabled=true;
+  try{
+    const report=await api("/api/mcp-tools");
+    toolCatalog=(report.tools||[]).sort((a,b)=>a.name.localeCompare(b.name));
+    filterTools(report.error);
+  }catch{
+    toolCatalog=[];
+    filterTools("Список инструментов недоступен");
+  }finally{
+    button.disabled=false;
+    showDiagnosticEvents();
+  }
+}
+function showDiagnosticEvents(){
+  const status=$("diagnostic-filter").value;
+  const entries=diagnosticEvents.filter(event=>!status||event.outcome===status);
+  $("diagnostic-status").textContent=diagnosticError||(entries.length?`Показано ${entries.length} из ${diagnosticEvents.length}`:"Вызовов нет");
+  $("diagnostic-table").hidden=!entries.length;
+  $("diagnostic-events").replaceChildren(...entries.map(event=>{
+    const line=document.createElement("tr");
+    const parts=[new Date(event.ts*1000).toLocaleString(),event.tool,
+      event.outcome==="ok"?"Успех":event.error_code||"Ошибка",
+      `${event.duration_ms} мс`,event.correlation_id];
+    parts.forEach(value=>{const cell=document.createElement("td");cell.textContent=value;line.append(cell)});
+    line.cells[2].className=event.outcome==="ok"?"ok":"bad";
+    if(toolCatalog.some(tool=>tool.name===event.tool&&tool.replayable)){
+      const replay=document.createElement("button");
+      replay.type="button";replay.className="b g";replay.textContent="Подготовить повтор";
+      replay.setAttribute("aria-label","Подготовить повтор "+event.tool);
+      replay.onclick=()=>prepareReplay(event.tool);
+      line.cells[1].append(document.createElement("br"),replay);
+    }
+    return line;
+  }));
+}
+async function loadDiagnosticEvents(){
+  const button=$("refresh-diagnostics");
+  if(button.disabled)return;
+  button.disabled=true;
+  try{
+    const report=await api("/api/diagnostics");
+    diagnosticEvents=report.events||[];
+    diagnosticError=report.error||"";
+  }catch{
+    diagnosticEvents=[];
+    diagnosticError="Журнал вызовов недоступен";
+  }finally{
+    button.disabled=false;
+    showDiagnosticEvents();
+  }
+}
+async function exportDiagnostics(){
+  try{
+    const response=await fetch("/api/diagnostics/export",{headers:{"X-PCB-Panel":K}});
+    if(!response.ok)throw new Error("export");
+    const link=document.createElement("a");
+    const url=URL.createObjectURL(await response.blob());
+    link.href=url;
+    link.download="pcbridge-diagnostics.json";
+    link.click();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+  }catch{
+    toast("Не удалось скачать журнал",true);
+  }
+}
+$("tool-search").oninput=()=>filterTools();
+$("tool-choice").onchange=showToolSchema;
+$("refresh-tools").onclick=loadToolCatalog;
+$("tool-replay").onsubmit=runTool;
+$("diagnostic-filter").onchange=()=>showDiagnosticEvents();
+$("refresh-diagnostics").onclick=loadDiagnosticEvents;
+$("export-diagnostics").onclick=exportDiagnostics;
+function tab(t){
+  const tabs={ov:"ov",feed:"feedtab",chg:"chg",work:"work",connections:"connections",
+    extensions:"extensions",security:"security",diagnostics:"diagnostics",settings:"settings"};
+  if(!(t in tabs))t="ov";
+  if(t!=="connections"&&showTok){
+    showTok=false;
+    drawConnectionFields();
+  }
+  window.scrollTo(0,0);
+  document.querySelectorAll("nav button").forEach(b=>{
+    const active=b.dataset.t===t;b.classList.toggle("on",active);
+    if(active)b.setAttribute("aria-current","page");else b.removeAttribute("aria-current");
+  });
+  Object.entries(tabs).forEach(([key,id])=>$(id).classList.toggle("on",key===t));
+  if(t==="feed")drawFeed();
+  if(t==="chg")loadChanges();
+  if(t==="security")loadClients().catch(()=>toast("Клиенты OAuth недоступны",true));
+  if(t==="extensions")loadExtensions().catch(()=>toast("Расширения недоступны",true));
+  if(t==="diagnostics"){loadToolCatalog();loadDiagnosticEvents()}
+  if(t==="work"){
+    loadJobs();
+    loadSessions().catch(()=>toast("Браузерные сессии недоступны",true));
+    loadDesktops().catch(()=>toast("Сессии Windows недоступны",true));
+  }
+}
 document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>tab(b.dataset.t));
 (async()=>{await load();await feed();const p=new URLSearchParams(location.search);history.replaceState(null,"","/?k="+K);
 const show=(p.get("show")||"").split(",").filter(Boolean),un=(p.get("undo")||"").split(",").filter(Boolean);
-if(p.get("tab"))tab(p.get("tab"));if(p.get("check"))check();
+if(p.get("tab"))tab(p.get("tab"));if(p.get("check")){tab("diagnostics");check()}
 if(show.length||un.length){tab("chg");await loadChanges();(un.length?un:[]).forEach(i=>sel.add(i));drawChanges();openChange((show[0]||un[0]));
 if(un.length){$("btext").innerHTML=`<b>Отменить ${un.length} изменение(й) агента?</b> Посмотрите разницу справа и нажмите «Отменить».`;$("banner").style.display="flex"}}})();
 setInterval(load,2000);setInterval(feed,1500);setInterval(()=>{if($("chg").classList.contains("on"))loadChanges()},6000);

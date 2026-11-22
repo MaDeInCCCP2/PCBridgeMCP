@@ -28,9 +28,10 @@ def safe_url(url):
 
 
 class BrowserService:
-    def __init__(self,allow_lan=False,clock=time.monotonic,playwright_factory=None):
+    def __init__(self,allow_lan=False,clock=time.monotonic,playwright_factory=None,shared_browser=None):
         self.allow_lan,self.clock=allow_lan,clock
         self.factory=playwright_factory
+        self.shared_browser = shared_browser
         self.pw=self.browser=self.context=None
         self.pages={};self.active=None;self.current={};self.events=collections.deque(maxlen=200)
         self.downloads={};self.tracing=False;self.headless=None
@@ -84,11 +85,15 @@ class BrowserService:
                 raise BrowserError('browser_mode_mismatch','Headless mode is fixed for this worker session. Close/restart it before changing mode.')
             return
         try:
-            if self.factory is None:
-                from playwright.sync_api import sync_playwright
-                self.pw=sync_playwright().start()
-            else:self.pw=self.factory()
-            self.browser=self.pw.chromium.launch(headless=bool(headless))
+            if self.shared_browser:
+                self.browser = self.shared_browser(bool(headless))
+            else:
+                if self.factory is None:
+                    from playwright.sync_api import sync_playwright
+                    self.pw = sync_playwright().start()
+                else:
+                    self.pw = self.factory()
+                self.browser = self.pw.chromium.launch(headless=bool(headless))
             self.context=self.browser.new_context(accept_downloads=True,service_workers='block')
             self.context.set_default_timeout(8000)
             self.context.set_default_navigation_timeout(15000)
@@ -126,7 +131,12 @@ class BrowserService:
         self.check_url(url);self._start(headless)
         if len([p for p in self.pages.values() if not p.is_closed()])>=10:
             raise BrowserError('page_limit','At most 10 owned pages may be open')
-        page=self.context.new_page();key=self._register(page);self.active=key
+        try:
+            page = self.context.new_page()
+        except Exception as error:
+            raise BrowserError('browser_page_start_failed', 'Could not open a page in the browser context.') from error
+        key = self._register(page)
+        self.active = key
         try:
             if url!='about:blank':page.goto(url,wait_until='domcontentloaded')
             return self.snapshot(key)
@@ -249,8 +259,12 @@ class BrowserService:
             elif action in ('check','uncheck'):
                 verified=locator.is_checked()==(action=='check');reason='checked state'
             elif action=='select':verified=locator.input_value()==value;reason='selected value'
-        except Exception:reason='Verification did not succeed; inspect current state'
-        result={'ok':True,'action_executed':True,'action':action,'verification':{'verified':verified,'reason':reason},
+        except Exception:
+            verified=False;reason='Verification did not succeed; inspect current state'
+        goal_supplied = bool(expect_text) or popup_expected or action in ('fill', 'check', 'uncheck', 'select')
+        status = 'verified' if verified else 'unverified' if goal_supplied else 'dispatched'
+        result={'ok':True,'action_executed':True,'action':action,
+                'verification':{'verified':verified,'reason':reason,'status':status},
                 'new_pages':[p for p in self.pages if p not in pages_before]}
         try:result['snapshot']=self.snapshot(key)
         except BrowserError as error:result['observation_error']=str(error)
@@ -315,14 +329,19 @@ class BrowserService:
         return {'ok':True,'closed':key,'active':self.active}
 
     def shutdown(self):
-        for obj in (self.context,self.browser):
+        for obj in (self.context, None if self.shared_browser else self.browser):
             if obj:
                 try:obj.close()
                 except Exception:pass
         if self.pw:
             try:self.pw.stop()
             except Exception:pass
-        self.context=self.browser=self.pw=None
+        self.context = self.browser = self.pw = self.headless = self.active = None
+        self.pages.clear()
+        self.current.clear()
+        self.events.clear()
+        self.downloads.clear()
+        self.tracing = False
         return {'ok':True}
 
     def dispatch(self,operation,arguments):
@@ -333,9 +352,160 @@ class BrowserService:
         return handlers[operation](**arguments)
 
 
+class BrowserContexts:
+    """One Playwright driver and at most two Chromium processes per worker.
+
+    Each (owner, session) gets its own BrowserContext and handle namespace.
+    """
+    def __init__(self, allow_lan=False, factory=None):
+        self.allow_lan = allow_lan
+        self.factory = factory
+        self.pw = None
+        self.browsers = {}
+        self.sessions = {}
+        self.active = {}
+
+    def browser(self, headless):
+        if self.pw is None:
+            if self.factory is None:
+                from playwright.sync_api import sync_playwright
+                self.pw = sync_playwright().start()
+            else:
+                self.pw = self.factory()
+        if headless not in self.browsers:
+            self.browsers[headless] = self.pw.chromium.launch(headless=headless)
+        return self.browsers[headless]
+
+    def remove(self, owner, session_id):
+        service = self.sessions.pop((owner, session_id))
+        service.shutdown()
+        for mode, browser in list(self.browsers.items()):
+            if not any(other.browser is browser for other in self.sessions.values()):
+                del self.browsers[mode]
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+        if self.active.get(owner) == session_id:
+            alternate = next((other for o, other in self.sessions if o == owner), None)
+            if alternate:
+                self.active[owner] = alternate
+            else:
+                self.active.pop(owner, None)
+
+    def reap(self):
+        for mode, browser in list(self.browsers.items()):
+            if not browser.is_connected():
+                del self.browsers[mode]
+                for (owner, session_id), service in list(self.sessions.items()):
+                    if service.browser is browser:
+                        self.remove(owner, session_id)
+
+    def _open(self, owner, arguments, session_id, session_limit):
+        key = (owner, session_id)
+        created = key not in self.sessions
+        if created:
+            if len(self.sessions) >= 16 or sum(o == owner for o, _ in self.sessions) >= session_limit:
+                raise BrowserError("browser_session_limit", "Close a browser session before opening another.")
+            self.sessions[key] = BrowserService(allow_lan=self.allow_lan, shared_browser=self.browser)
+        service = self.sessions[key]
+        try:
+            snapshot = service.open(**arguments)
+        except BrowserError as error:
+            if created and not service.pages:
+                self.remove(owner, session_id)
+            elif service.pages:
+                self.active[owner] = session_id
+                error.details["session_id"] = session_id
+            raise
+        self.active[owner] = session_id
+        return {**snapshot, **self.info(session_id, service)}
+
+    @staticmethod
+    def info(session_id, service):
+        return {"session_id": session_id, "mode": "browser", "state": "ready",
+                "headless": service.headless, "isolation": "browser_context",
+                "desktop_interference": "no_physical_input" if service.headless else "may_change_focus"}
+
+    def dispatch(self, operation, arguments):
+        self.reap()
+        arguments = dict(arguments)
+        owner = arguments.pop("_owner", "owner")
+        session_limit = arguments.pop("_session_limit", 4)
+        owned = {session_id: service for (o, session_id), service in self.sessions.items() if o == owner}
+        if operation == "session_inventory":
+            sessions = []
+            for (principal, sid), service in self.sessions.items():
+                pages = {key for key, page in service.pages.items() if not page.is_closed()}
+                snapshots = sum(key in pages and service.clock() - snapshot["created"] < 120
+                                for key, snapshot in service.current.items())
+                sessions.append({**self.info(sid, service), "owner": principal, "pages": len(pages),
+                                 "snapshots": snapshots, "active": sid == self.active.get(principal)})
+            return {"sessions": sessions}
+        if operation == "open":
+            return self._open(owner, arguments, "default", session_limit)
+        if operation == "session_open":
+            try:
+                result = self._open(owner, arguments, uuid.uuid4().hex, session_limit)
+            except BrowserError as error:
+                error.details["_live_sessions"] = list(self.sessions)
+                raise
+            return {**result, "_live_sessions": list(self.sessions)}
+        if operation == "sessions":
+            return {"ok": True, "sessions": [self.info(k, v) for k, v in owned.items()]}
+        if operation == "session_close":
+            session_id = arguments["session_id"]
+            if session_id not in owned:
+                raise BrowserError("unknown_browser_session", "Browser session is unavailable.")
+            self.remove(owner, session_id)
+            return {"ok": True, "closed_session_id": session_id}
+        if operation == "tabs":
+            pages = []
+            for session_id, service in owned.items():
+                pages.extend({**page, "session_id": session_id,
+                              "active": page["active"] and session_id == self.active.get(owner)}
+                             for page in service.tabs()["pages"])
+            return {"ok": True, "pages": pages, "owned_browser_only": True}
+
+        page_id = arguments.get("page_id")
+        if operation == "owned_action":
+            service = owned.get(arguments.pop("session_id"))
+            if service is None:
+                raise BrowserError("unknown_browser_session", "Browser session is unavailable.")
+            if page_id not in service.pages:
+                raise BrowserError("unknown_page", "This page does not belong to the specified browser session.")
+            return service.action(**arguments)
+        download_id = arguments.get("download_id")
+        if page_id or download_id:
+            service = next((service for service in owned.values()
+                            if (page_id and page_id in service.pages)
+                            or (download_id and download_id in service.downloads)), None)
+        elif operation == "trace":
+            service = owned.get("default")
+        else:
+            service = owned.get(self.active.get(owner))
+        if service is None:
+            if operation == "diagnostics" and not page_id:
+                return {"ok": True, "events": [], "downloads": [], "tracing": False}
+            code = "unknown_download" if download_id else "unknown_page"
+            raise BrowserError(code, "Browser page or session is unavailable.")
+        return service.dispatch(operation, arguments)
+
+    def shutdown(self):
+        for owner, session_id in list(self.sessions):
+            self.remove(owner, session_id)
+        for browser in self.browsers.values():
+            try:
+                browser.close()
+            except Exception:
+                pass
+        if self.pw:
+            self.pw.stop()
+
+
 def main():
     sys.stdin.reconfigure(encoding='utf-8');sys.stdout.reconfigure(encoding='utf-8')
-    service=BrowserService(allow_lan='--allow-lan' in sys.argv)
+    service=BrowserContexts(allow_lan='--allow-lan' in sys.argv)
     try:
         for line in sys.stdin:
             request={}

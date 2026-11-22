@@ -29,6 +29,7 @@ ROOT = Path(os.environ.get("PCBRIDGE_ROOT") or APP.parent).resolve()
 LOGS = ROOT / "logs"
 CFG_PATH = ROOT / "config.json"
 STATE = LOGS / "state.json"
+TUNNEL_ORIGIN = LOGS / "tunnel-origin.txt"
 PIDS = LOGS / "pids.json"
 STOP_FLAG = LOGS / "stop.flag"
 PAUSE_FLAG = LOGS / "paused.flag"
@@ -71,7 +72,7 @@ def parse_ngrok_log(text: str) -> dict:
 
 
 def ngrok_args(cfg: dict, port: int) -> list:
-    args = ["http", str(port), "--host-header=rewrite", "--inspect=false", "--log=stdout"]
+    args = ["http", str(port), "--inspect=false", "--log=stdout"]
     dom = str(cfg.get("ngrok_domain") or "").strip()
     if dom:
         dom = re.sub(r"^https?://", "", dom).strip("/")
@@ -288,6 +289,10 @@ class Ngrok(Child):
 
         return shutil.which("ngrok") or ""
 
+    def stop(self):
+        super().stop()
+        TUNNEL_ORIGIN.unlink(missing_ok=True)
+
     def cmd(self):
         exe = self.exe()
         if not exe:
@@ -323,8 +328,8 @@ class Ngrok(Child):
                 info = {}
             if info.get("url"):
                 if info["url"] != self.url:
-                    old, self.url = self.url, info["url"]
-                    self.sup.url_changed(old, self.url)
+                    self.sup.url_changed(self.url, info["url"])
+                    self.url = info["url"]
                 if self.status != "ok":
                     self.sup.event("tunnel_up", "Туннель ngrok открыт - агент может подключаться")
                 self.status, self.error = "ok", ""
@@ -468,7 +473,7 @@ class Supervisor:
         self._phase = False
         self.version = "?"
         try:
-            self.version = (ROOT / "VERSION.txt").read_text(encoding="utf-8").strip()
+            self.version = (APP.parent / "VERSION.txt").read_text(encoding="utf-8-sig").strip()
         except OSError:
             pass
 
@@ -478,10 +483,11 @@ class Supervisor:
         if NOTIFY_OFF.exists() or self.cfg.get("notifications", True) is False or self.icon is None or not text:
             return
         now = time.time()
-        if not force and (now - self._notes.get(text, 0) < 60 or now - self._note_t < 4):  # no spam
+        notice = (title, text)
+        if not force and (now - self._notes.get(notice, 0) < 60 or now - self._note_t < 4):  # no spam
             return
-        self._notes[text] = self._note_t = now
-        if buttons and IS_WIN and self.panel and self.cfg.get("toast_buttons", True) is not False:
+        self._notes[notice] = self._note_t = now
+        if (buttons or launch) and IS_WIN and self.panel and self.cfg.get("toast_buttons", True) is not False:
             threading.Thread(target=self.toast, args=(text, title, list(buttons), launch), daemon=True).start()
             return
         self.plain_notify(text, title)
@@ -511,6 +517,10 @@ class Supervisor:
         self.notify(text)
 
     def url_changed(self, old: str, new: str) -> None:
+        # This value comes from the supervised ngrok process, never from a request header.
+        temp = TUNNEL_ORIGIN.with_suffix(".tmp")
+        temp.write_text(new, encoding="utf-8")
+        os.replace(temp, TUNNEL_ORIGIN)
         url = mcp_url(new, self.cfg)
         try:
             (ROOT / "URL.txt").write_text(url + "\n", encoding="utf-8")
@@ -609,10 +619,25 @@ class Supervisor:
                         e = json.loads(line)
                     except ValueError:
                         continue
-                    btn = [("Открыть ленту", self.panel.url(tab="feed"))] if self.panel and e.get("kind") == "denied" else []
-                    self.notify(str(e.get("text", "")), buttons=btn)
+                    self.event_notice(e)
             except OSError:
                 pass
+
+    def event_notice(self, event: dict) -> None:
+        kind = event.get("kind")
+        if kind == "connected":
+            buttons = [("Открыть обзор", self.panel.url(tab="ov"))] if self.panel else []
+            self.notify("Агент начал работу с PC Bridge.", title="Агент подключён", buttons=buttons)
+        elif kind == "denied":
+            text = event.get("text")
+            if text not in ("Запуск отклонён на компьютере.", "Время ожидания подтверждения истекло.",
+                            "Другое подтверждение уже ожидает ответа.", "Окно подтверждения недоступно.",
+                            "Запуск заблокирован настройками PC Bridge."):
+                text = "PC Bridge остановил запуск команды."
+            buttons = [("Открыть ленту действий", self.panel.url(tab="feed"))] if self.panel else []
+            self.notify(text, title="Команда не запущена", buttons=buttons)
+        else:
+            self.notify(str(event.get("text", "")))
 
     def watch_changes(self, quiet: float = 8.0, max_wait: float = 45.0) -> None:
         """File changes of the agent -> one notification per batch: "Changed 3 files" [Show] [Undo]."""
@@ -645,10 +670,12 @@ class Supervisor:
         if not n:
             return
         ids = ",".join(e["id"] for e in entries)[:1500]
-        text = f"Агент изменил {n} {plural(n, 'файл', 'файла', 'файлов')}\n" + ", ".join(names[:4]) + (" ..." if n > 4 else "")
+        title = f"Агент изменил {n} {plural(n, 'файл', 'файла', 'файлов')}"
+        text = ", ".join(names[:3]) + (f" и ещё {n - 3}" if n > 3 else "")
         self.log("CHANGES", n, ids[:200])
-        self.notify(text, buttons=[("Показать", self.panel.url(show=ids)), ("Отменить", self.panel.url(undo=ids))],
-                    force=True)
+        self.notify(text, title=title,
+                    buttons=[("Посмотреть изменения", self.panel.url(show=ids)),
+                             ("Проверить отмену", self.panel.url(undo=ids))], force=True)
 
     # -- tray ----------------------------------------------------------------
     def status_text(self) -> str:
@@ -900,7 +927,7 @@ class Supervisor:
                 I("Рабочую папку", lambda *_: self.open_path(self.cfg.get("workspace") or ROOT)),
                 I("Папку логов", lambda *_: self.open_path(LOGS)),
                 I("Папку PC Bridge", lambda *_: self.open_path(ROOT)),
-                I("Инструкцию (README)", lambda *_: self.open_path(ROOT / "README.txt")),
+                I("Инструкцию (README)", lambda *_: self.open_path(ROOT / "README.md")),
             )),
             SEP,
             I("Перезапустить мост", self.restart_bridge),
@@ -969,6 +996,7 @@ class Supervisor:
 
     def run(self) -> None:
         self.log("SUPERVISOR START", self.version, "pid", os.getpid())
+        TUNNEL_ORIGIN.unlink(missing_ok=True)
         try:
             STOP_FLAG.unlink()
         except OSError:

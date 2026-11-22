@@ -29,12 +29,16 @@ import threading
 import time
 import urllib.parse
 import uuid
+import unicodedata
+from contextvars import ContextVar
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import anyio
 import httpx
-from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.mcpserver import Context, MCPServer, Image
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult, TextContent
 
 # ---------------------------------------------------------------- config ----
@@ -73,7 +77,7 @@ log.propagate = False
 def _cleanup_logs(days: int) -> None:
     """Old job logs and Blender helper scripts would pile up forever - remove the ones older than N days."""
     cutoff = time.time() - max(1, days) * 86400
-    for pattern in ("job_*.log", "bl_*.py"):
+    for pattern in ("job_*.log", "bl_*.py", "desktop-worker-*.log"):
         for f in LOGS.glob(pattern):
             try:
                 if f.stat().st_mtime < cutoff:
@@ -190,6 +194,8 @@ def _args_text(args: dict) -> str:
     for k, v in args.items():
         if v is None or v == "" or v == [] or v == {}:
             continue
+        if k == "risk_explanation":
+            continue
         if k in {"steps", "stdin_text", "argv", "env_delta"}:
             parts.append(f"{k}=<{len(v)}>")
         elif k in _LONG_ARGS and isinstance(v, str) and (len(v) > 80 or "\n" in v):
@@ -197,8 +203,8 @@ def _args_text(args: dict) -> str:
             parts.append(f"{k}=<{len(v.splitlines())} строк, {len(v)} симв.: {_short(first.strip(), 60)}>")
         elif k in _LONG_ARGS and isinstance(v, list):
             parts.append(f"{k}=<{len(v)} шт.>")
-        elif k == "value":
-            parts.append(f"value=<{len(str(v))} chars>")
+        elif k in {"value", "expect_text"}:
+            parts.append(f"{k}=<{len(str(v))} chars>")
         elif k == "command":
             parts.append(f"{k}={_short(v, 600)}")
         else:
@@ -341,13 +347,16 @@ def _changes_since(t0: float) -> list:
     return out
 
 
+_diagnostic_replay = ContextVar("pcbridge_diagnostic_replay", default=False)
+
+
 def _act_start(name: str, args: dict) -> None:
-    if CONSOLE_ON and name not in READ_TOOLS:
+    if CONSOLE_ON and not _diagnostic_replay.get() and name not in READ_TOOLS:
         act(f"{_ts()}  ▶ {name}  {_args_text(args)}")
 
 
 def _act_end(name: str, args: dict, t0: float, res=None, exc=None) -> None:
-    if not CONSOLE_ON:
+    if not CONSOLE_ON or _diagnostic_replay.get():
         return
     try:
         dt = time.time() - t0
@@ -395,11 +404,15 @@ READ_TOOLS = {
     "read_screen_text", "clipboard_get", "list_processes", "system_stats", "list_changes",
     "unreal_list_engines", "unreal_list_templates", "unreal_read_log", "unreal_result",
     "file_info", "preview_file_edits", "file_edit_status", "read_job_output",
-    "ui_snapshot", "ui_find", "ui_wait", "ui_find_live", "ui_snapshot_diff", "ui_diagnose",
+    "ui_snapshot", "ui_find", "ui_wait", "ui_find_live", "ui_snapshot_diff", "ui_diagnose", "ui_operation",
     "browser_tabs", "browser_snapshot", "browser_find", "browser_wait", "browser_diagnostics",
-    "computer_observe", "computer_find_target", "computer_verify", "computer_capabilities",
-    "computer_operation", "observe_focus", "read_files_batch",
+    "computer_observe", "computer_find_target", "computer_verify", "computer_capabilities", "computer_sessions", "computer_isolation_status",
+    "desktop_apps", "desktop_sessions", "desktop_windows", "desktop_snapshot", "desktop_operation", "desktop_wait",
+    "desktop_peer_operation", "computer_receipt",
+    "computer_operation", "observe_focus", "read_files_batch", "browser_sessions", "browser_operation", "computer_plan", "computer_plan_history", "skills_list", "skill_read", "plugins_list",
 }
+# These probes report configuration or compute a plan without dispatching work.
+_DIAGNOSTIC_REPLAY_TOOLS = {"computer_capabilities", "computer_plan"} & READ_TOOLS
 _BRIEF_KEYS = ("path", "source", "command", "window", "text_to_find", "target", "url", "query", "pattern", "project", "text")
 
 
@@ -411,6 +424,8 @@ def _before_tool(name: str, kwargs: dict) -> None:
         raise ValueError(f"PC Bridge is in READ-ONLY mode, so {name} is refused (it could change something). "
                          "You can still read and search files, use git status/diff/log and take screenshots. "
                          "If a change is needed, describe it in chat (the user can switch read-only off in the tray).")
+    if _diagnostic_replay.get():
+        return  # The inspector records only the structured diagnostic event.
     now = time.time()
     if now - _last_call["t"] > 600:
         emit("connected", "Notion-агент подключился и начал работу")
@@ -428,6 +443,53 @@ def _before_tool(name: str, kwargs: dict) -> None:
         pass
 
 
+FOREGROUND_ACTIONS = frozenset({
+    "mouse_click", "mouse_drag", "scroll", "type_text", "press_keys", "click_text",
+    "clipboard_set", "open_path", "ui_action", "ui_run_steps", "computer_run_steps",
+})
+_foreground_lock = threading.Lock()
+_diagnostics_module = _load_bridge_module("diagnostics")
+_diagnostics = _diagnostics_module.Diagnostics(LOGS / "diagnostics.jsonl")
+
+
+_principal = ContextVar("pcbridge_tool_principal", default="owner")
+
+
+def request_principal():
+    return _principal.get()
+
+
+def _client_profile(principal):
+    if principal == "owner":
+        return {}
+    profiles = CFG.get("client_profiles", {})
+    profile = profiles.get(principal, {}) if isinstance(profiles, dict) else None
+    return profile if isinstance(profile, dict) else {"tools": [], "skills": [], "plugins": []}
+
+
+def _session_limit(owner, name, default):
+    value = _client_profile(owner).get(name, default)
+    return max(0, min(default, value)) if type(value) is int else default
+
+
+def _profile_allows(profile, group, name):
+    allowed = profile.get(group)
+    return group not in profile or (isinstance(allowed, list) and name in allowed)
+
+
+def _principal_from_context(ctx):
+    try:
+        request = ctx.request_context.request
+    except ValueError:
+        return "owner"  # Direct in-process tool calls (such as unit tests).
+    if not TOKEN_AUTH:
+        return "owner"
+    principal = request.scope.get("pcbridge_principal") if request is not None else None
+    if not principal:
+        raise BridgeError("missing_principal", "Requests require an authenticated client.")
+    return principal
+
+
 def _guarded(fn):
     """Every tool goes through this: pause, read-only mode, the 'now doing' line of the tray icon and the console."""
     name = fn.__name__
@@ -442,23 +504,40 @@ def _guarded(fn):
         except TypeError:
             return dict(kwargs)
 
+    def enter(a):
+        _before_tool(name, a)
+        foreground = name in FOREGROUND_ACTIONS
+        if foreground and not _foreground_lock.acquire(blocking=False):
+            raise BridgeError("foreground_busy", "Another foreground action is running. Observe again after it finishes.")
+        _busy(1)
+        return foreground
+
+    def report(correlation, started, result=None, error=None):
+        _diagnostics.tool_finished(correlation, request_principal(), name, started, result=result, error=error)
+
+    def leave(foreground):
+        _busy(-1)
+        if foreground:
+            _foreground_lock.release()
+
     if inspect.iscoroutinefunction(fn):
         @functools.wraps(fn)
         async def awrapper(*args, **kwargs):
             a, t0 = bound(args, kwargs), time.time()
+            correlation, started = uuid.uuid4().hex, time.monotonic()
             _act_start(name, a)
-            busy = False
+            foreground = None
             try:
-                _before_tool(name, kwargs)
-                _busy(1)
-                busy = True
+                foreground = enter(a)
                 res = await fn(*args, **kwargs)
             except BaseException as e:
-                if busy:
-                    _busy(-1)
+                report(correlation, started, error=e)
                 _act_end(name, a, t0, exc=e)
                 raise
-            _busy(-1)
+            finally:
+                if foreground is not None:
+                    leave(foreground)
+            report(correlation, started, res)
             _act_end(name, a, t0, res)
             return res
 
@@ -467,19 +546,20 @@ def _guarded(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         a, t0 = bound(args, kwargs), time.time()
+        correlation, started = uuid.uuid4().hex, time.monotonic()
         _act_start(name, a)
-        busy = False
+        foreground = None
         try:
-            _before_tool(name, kwargs)
-            _busy(1)
-            busy = True
+            foreground = enter(a)
             res = fn(*args, **kwargs)
         except BaseException as e:
-            if busy:
-                _busy(-1)
+            report(correlation, started, error=e)
             _act_end(name, a, t0, exc=e)
             raise
-        _busy(-1)
+        finally:
+            if foreground is not None:
+                leave(foreground)
+        report(correlation, started, res)
         _act_end(name, a, t0, res)
         return res
 
@@ -662,61 +742,68 @@ def _similar_key(command: str, reasons: list) -> str:
     return "|".join(sorted(reasons)) + "|" + first
 
 
-def _dialog(command: str, reasons: list, cwd: str, allow_similar: bool):
+def _risk_explanation(text: str) -> str:
+    # Keep agent-supplied context as plain text, including in a native fallback.
+    text = "".join(" " if c.isspace() else c for c in text[:1200]
+                   if c.isspace() or not unicodedata.category(c).startswith("C"))
+    return " ".join(text.split())[:600].strip()
+
+
+def _dialog(command: str, reasons: list, cwd: str, allow_similar: bool, *, explanation="", ai_reason=""):
     """The PC Bridge confirmation window (confirm_dialog.py, tkinter). None = not available -> plain message box."""
     if not IS_WIN and not os.environ.get("PCBRIDGE_DIALOG"):
         return None
     py = Path(sys.executable)
     exe = py.with_name("pythonw.exe") if py.with_name("pythonw.exe").exists() else py
-    req = LOGS / f"confirm_{uuid.uuid4().hex[:8]}.json"
+    payload = json.dumps({"command": command[:20000], "reasons": reasons, "cwd": cwd,
+                          "timeout": CONFIRM_TIMEOUT, "spans": danger_spans(command[:20000]),
+                          "allow_similar": allow_similar, "similar_minutes": SIMILAR_MINUTES,
+                          "command_truncated": len(command) > 20000,
+                          "risk_explanation": explanation, "local_ai_reason": ai_reason},
+                         ensure_ascii=False).encode("utf-8")
     try:
-        req.write_text(json.dumps({"command": command[:20000], "reasons": reasons, "cwd": cwd,
-                                   "timeout": CONFIRM_TIMEOUT, "spans": danger_spans(command[:20000]),
-                                   "allow_similar": allow_similar, "similar_minutes": SIMILAR_MINUTES},
-                                  ensure_ascii=False), encoding="utf-8")
-        r = subprocess.run([str(exe), str(APP / "server" / "confirm_dialog.py"), str(req)], capture_output=True,
-                           text=True, timeout=CONFIRM_TIMEOUT + 20, creationflags=NO_WINDOW)
-        word = (r.stdout or "").strip().splitlines()[-1:] or [""]
-        if r.returncode == 0 and word[0] in ("yes", "similar", "no", "timeout"):
-            return word[0]
-        log.warning("DIALOG failed rc=%s err=%s", r.returncode, (r.stderr or "")[-300:])
+        r = subprocess.run([str(exe), str(APP / "server" / "confirm_dialog.py"), "-"], input=payload,
+                           capture_output=True, timeout=CONFIRM_TIMEOUT + 20, creationflags=NO_WINDOW)
+        word = r.stdout.strip().splitlines()[-1:] or [b""]
+        if r.returncode == 0 and word[0] in (b"yes", b"similar", b"no", b"timeout"):
+            return word[0].decode("ascii")
+        log.warning("DIALOG failed rc=%s", r.returncode)
         return None
     except subprocess.TimeoutExpired:
         return "timeout"
-    except Exception as e:
-        log.warning("DIALOG failed: %s", e)
+    except OSError as e:
+        log.warning("DIALOG failed: %s", type(e).__name__)
         return None
-    finally:
-        try:
-            req.unlink()
-        except OSError:
-            pass
 
 
-def _ask_user(command: str, reasons: list, cwd: str) -> str:
+def _ask_user(command: str, reasons: list, cwd: str, *, explanation="", ai_reason="") -> str:
     key = _similar_key(command, reasons)
-    if _similar_ok.get(key, 0) > time.time():
+    allow_similar = not any(r.endswith(_NO_SIMILAR) for r in reasons)
+    if allow_similar and _similar_ok.get(key, 0) > time.time():
         return "similar_ok"
-    allow_similar = not any(r in _NO_SIMILAR or r.endswith(_NO_SIMILAR) for r in reasons)
     if not _confirm_lock.acquire(timeout=CONFIRM_TIMEOUT):
         return "busy"
     try:
-        ans = _dialog(command, reasons, cwd, allow_similar)
+        ans = _dialog(command, reasons, cwd, allow_similar, explanation=explanation, ai_reason=ai_reason)
     finally:
         _confirm_lock.release()
     if ans == "similar":
-        if allow_similar:
-            _similar_ok[key] = time.time() + SIMILAR_MINUTES * 60
-            act(f"{_ts()}  ⚠ похожие команды разрешены на {SIMILAR_MINUTES} мин: {key.rsplit('|', 1)[-1]}")
+        if not allow_similar:
+            return "no"
+        _similar_ok[key] = time.time() + SIMILAR_MINUTES * 60
+        act(f"{_ts()}  ⚠ похожие команды разрешены на {SIMILAR_MINUTES} мин: {key.rsplit('|', 1)[-1]}")
         return "yes"
     if ans is not None:
         return ans
     shown = command if len(command) <= 1500 else command[:1500] + " ..."
-    text = ("Notion-агент хочет выполнить команду, которая может навредить компьютеру.\n\n"
-            "Почему опасно: " + "; ".join(reasons) + "\n"
-            "Папка: " + cwd + "\n\n" + shown + "\n\n"
-            "Разрешить? Если вы не просили об этом - нажмите «Нет».\n"
-            f"Без ответа через {CONFIRM_TIMEOUT} с команда будет отменена.")
+    sections = ["PC Bridge запрашивает подтверждение запуска.",
+                "Проверка PC Bridge\n" + "\n".join(reasons) if not ai_reason else
+                "Локальная ИИ-проверка\n" + ai_reason]
+    if explanation:
+        sections.append("Пояснение от агента (предоставлено агентом)\n" + explanation)
+    sections.extend(["Рабочая папка\n" + cwd, "Команда\n" + shown,
+                     f"Без ответа команда будет отменена через {CONFIRM_TIMEOUT} с."])
+    text = "\n\n".join(sections)
     return _confirm_box(text, "PC Bridge - подтвердите опасную команду")
 
 
@@ -845,18 +932,21 @@ _DENIED = {
 }
 
 
-def check_command(command: str, cwd: str, *, redact=False):
+def check_command(command: str, cwd: str, *, redact=False, risk_explanation=""):
     """None = run it. Otherwise a result for the agent explaining why the command did not run."""
     if DANGER_MODE == "off":
         return None
     reasons = danger_reasons(command, cwd)
+    ai_reason = ""
     if not reasons:
         ai = ai_review(command, cwd, redact=True) if redact else ai_review(command, cwd)
         if ai:
             reasons = [ai]
+            ai_reason = _risk_explanation(ai.removeprefix("ИИ-проверка: "))
     if not reasons:
         return None
-    answer = "block" if DANGER_MODE == "block" else _ask_user(command, reasons, cwd)
+    answer = "block" if DANGER_MODE == "block" else _ask_user(
+        command, reasons, cwd, explanation=_risk_explanation(risk_explanation), ai_reason=ai_reason)
     if redact:
         log.info("DANGER answer=%s structured process (arguments redacted)", answer)
         act(f"{_ts()}  ⚠ проверка запуска процесса: ответ пользователя = {answer}")
@@ -865,7 +955,14 @@ def check_command(command: str, cwd: str, *, redact=False):
         act(f"{_ts()}  ⚠ опасная команда ({'; '.join(reasons)}): ответ пользователя = {answer}")
     if answer in ("yes", "similar_ok"):
         return None
-    emit("denied", "Отказано в запуске процесса" if redact else "Отказано в команде: " + command.replace("\n", " ")[:120])
+    notice = {
+        "no": "Запуск отклонён на компьютере.",
+        "timeout": "Время ожидания подтверждения истекло.",
+        "busy": "Другое подтверждение уже ожидает ответа.",
+        "unavailable": "Окно подтверждения недоступно.",
+        "block": "Запуск заблокирован настройками PC Bridge.",
+    }
+    emit("denied", notice[answer])
     return {"exit_code": None, "ran": False, "needs_user_ok": True, "reasons": reasons, "user_answer": answer,
             "error": _DENIED[answer].format(t=CONFIRM_TIMEOUT)}
 
@@ -921,24 +1018,28 @@ if IS_WIN and flag("enable_screen"):
                      "Set consequential=true before irreversible actions; obtain user approval via the local dialog. "
                      "Repeated operation_id returns its existing state. On unknown outcome observe again.")
 
-kwargs = dict(
-    host="127.0.0.1",
-    port=PORT,
-    streamable_http_path=MCP_PATH,
-    stateless_http=True,
-    json_response=True,
-)
-# Newer mcp versions block non-localhost Host/Origin headers by default. The protection targets browsers on this PC;
-# here every request must carry the token (or the secret URL), so a rebinding page cannot use the server anyway,
-# while the strict check could reject Notion's requests coming through ngrok.
-try:
-    from mcp.server.transport_security import TransportSecuritySettings
+async def enforce_client_profile(ctx, call_next):
+    if not TOKEN_AUTH or ctx.method not in ("tools/list", "tools/call"):
+        return await call_next(ctx)
+    principal = ctx.request.scope.get("pcbridge_principal") if ctx.request is not None else None
+    profile = _client_profile(principal) if principal else {"tools": []}
+    if "tools" not in profile:
+        return await call_next(ctx)
+    if ctx.method == "tools/call":
+        name = (ctx.params or {}).get("name")
+        if isinstance(name, str) and not _profile_allows(profile, "tools", name):
+            message = "Tool is unavailable in this client's profile."
+            data = {"ok": False, "error": message, "error_code": "tool_not_granted"}
+            return CallToolResult(content=[TextContent(type="text", text=json.dumps(data))],
+                                  structured_content=data, is_error=True)
+        return await call_next(ctx)
+    result = await call_next(ctx)
+    return {**result, "tools": [
+        tool for tool in result["tools"] if _profile_allows(profile, "tools", tool["name"])
+    ]}
 
-    kwargs["transport_security"] = TransportSecuritySettings(enable_dns_rebinding_protection=False)
-except Exception:
-    pass
 
-mcp = FastMCP("PC Bridge", instructions=INSTRUCTIONS, **kwargs)
+mcp = MCPServer("PC Bridge", instructions=INSTRUCTIONS, middleware=[enforce_client_profile])
 
 
 # every tool (registered below with @mcp.tool) goes through _guarded: pause, read-only, tray activity
@@ -949,26 +1050,39 @@ def _tool_with_guard(*args, **kwargs):
     register = _orig_tool(*args, **kwargs)
     def decorate(fn):
         guarded = _guarded(fn)
-        if inspect.signature(fn).return_annotation is not dict:
-            return register(guarded)
+        signature = inspect.signature(fn)
+        structured = signature.return_annotation is dict
 
         @functools.wraps(fn)
-        async def transport(*a, **kw):
+        async def transport(*a, pcbridge_context, **kw):
+            principal = _principal.set(_principal_from_context(pcbridge_context))
             try:
                 result = await guarded(*a, **kw) if inspect.iscoroutinefunction(guarded) else await anyio.to_thread.run_sync(functools.partial(guarded, *a, **kw))
+                if not structured:
+                    return result
                 data = dict(result)
                 data.setdefault("ok", not bool(data.get("error")) and data.get("ran", True) is not False
                                 and (data.get("exit_code") in (None, 0)))
                 return CallToolResult(content=[TextContent(type="text", text=json.dumps(data, ensure_ascii=False))],
-                                      structuredContent=data, isError=not data["ok"])
+                                      structured_content=data, is_error=not data["ok"])
             except Exception as e:
+                if not structured:
+                    raise
                 code = getattr(e, "code", "invalid_argument" if isinstance(e, ValueError) else "io_error" if isinstance(e, OSError) else "tool_failed")
                 data = {"ok": False, "error": str(e), "error_code": code, "details": getattr(e, "details", {})}
                 return CallToolResult(content=[TextContent(type="text", text=json.dumps(data, ensure_ascii=False))],
-                                      structuredContent=data, isError=True)
+                                      structured_content=data, is_error=True)
+            finally:
+                _principal.reset(principal)
 
-        transport.__signature__ = inspect.signature(fn).replace(return_annotation=CallToolResult)
-        transport.__annotations__ = {**fn.__annotations__, "return": CallToolResult}
+        # SDK v2 injects Context without adding it to the wire input schema.
+        context = inspect.Parameter("pcbridge_context", inspect.Parameter.KEYWORD_ONLY, annotation=Context)
+        return_type = CallToolResult if structured else signature.return_annotation
+        transport.__signature__ = signature.replace(parameters=[*signature.parameters.values(), context],
+                                                    return_annotation=return_type)
+        transport.__annotations__ = {**fn.__annotations__, "pcbridge_context": Context}
+        if structured:
+            transport.__annotations__["return"] = CallToolResult
         register(transport)
         return guarded
     return decorate
@@ -979,10 +1093,7 @@ mcp.tool = _tool_with_guard
 
 def text_tool(fn):
     """Register a tool whose result is plain text (no duplicated structured copy of big outputs)."""
-    try:
-        return mcp.tool(structured_output=False)(fn)
-    except TypeError:  # older mcp without structured output
-        return mcp.tool()(fn)
+    return mcp.tool(structured_output=False)(fn)
 
 
 _file_lock = threading.RLock()
@@ -1145,7 +1256,7 @@ _jobs_lock = threading.RLock()
 
 def _save_job(jid: str, job: dict) -> None:
     JOB_DIR.mkdir(exist_ok=True)
-    meta = {k: job.get(k) for k in ("label", "started", "outputs", "pid", "create_time", "status", "exit_code", "finished", "resources", "structured")}
+    meta = {k: job.get(k) for k in ("label", "started", "outputs", "pid", "create_time", "status", "exit_code", "finished", "resources", "structured", "owner")}
     meta["job_id"] = jid
     atomic_write(JOB_DIR / f"{jid}.json", json.dumps(meta, ensure_ascii=False).encode("utf-8"))
 
@@ -1159,7 +1270,9 @@ def _load_jobs() -> None:
         try:
             meta = json.loads(f.read_text(encoding="utf-8"))
             jid = f.stem
-            if meta.get("job_id") != jid:
+            if (not isinstance(meta, dict) or meta.get("job_id") != jid
+                    or type(meta.get("started")) not in (int, float)
+                    or not 0 < meta["started"] <= 253402300799):
                 continue
             meta.update(proc=None, fh=None, log=LOGS / f"job_{jid}.log", recovered=True)
             JOBS[jid] = meta
@@ -1188,7 +1301,8 @@ def _job_state(jid: str, job: dict) -> dict:
         result = JOB_DIR / f"{jid}.result.json"
         try:
             data = json.loads(result.read_text(encoding="utf-8"))
-            if data.get("job_id") != jid or data.get("status") not in ("completed", "failed"):
+            if (not isinstance(data, dict) or data.get("job_id") != jid
+                    or data.get("status") not in ("completed", "failed")):
                 raise ValueError("Invalid job result")
             job.update({k: data.get(k) for k in ("status", "exit_code", "finished", "error", "phase", "error_code", "executed", "artifacts")})
         except FileNotFoundError:
@@ -1218,12 +1332,27 @@ def _job_state(jid: str, job: dict) -> dict:
 
 def start_job(cmd, cwd=None, label: str = "", outputs=None, *, structured=None, resources=None) -> dict:
     with _jobs_lock:
-        if resources:
-            for jid, candidate in JOBS.items():
-                shared = set(resources).intersection(candidate.get("resources") or [])
-                if shared and _job_state(jid, candidate)["running"]:
+        owner = request_principal()
+        profile = _client_profile(owner)
+        try:
+            limit = max(1, int(profile.get("job_max_active", CFG.get("job_max_active_per_client", 8))))
+        except (TypeError, ValueError):
+            limit = 8
+        active = 0
+        for jid, candidate in JOBS.items():
+            if candidate.get("status") in ("completed", "failed", "stopped"):
+                continue
+            same_client = candidate.get("owner") == owner and owner != "owner"
+            shared = set(resources or ()).intersection(candidate.get("resources") or ())
+            if (same_client or shared) and _job_state(jid, candidate)["running"]:
+                if shared:
                     return {"ok": False, "error_code": "resource_busy", "error": "Resources are held by a running job.",
-                            "resources": sorted(shared), "owner_job_id": jid, "executed": False, "phase": "lock"}
+                            "resources": sorted(shared), "executed": False, "phase": "lock",
+                            **({"owner_job_id": jid} if _job_visible(candidate) else {})}
+                active += 1
+                if active >= limit:
+                    return {"ok": False, "error_code": "job_quota", "error": "Client has reached its active job limit.",
+                            "limit": limit, "executed": False, "phase": "quota"}
         return _start_job(cmd, cwd, label, outputs, structured, resources)
 
 
@@ -1236,7 +1365,7 @@ def _start_job(cmd, cwd, label, outputs, structured, resources) -> dict:
     logf = LOGS / f"job_{jid}.log"
     job = {"label": label, "started": time.time(), "outputs": outputs or [], "status": "starting",
            "pid": None, "create_time": None, "exit_code": None, "log": logf, "proc": None, "fh": None,
-           "resources": resources or [], "structured": structured is not None}
+           "resources": resources or [], "structured": structured is not None, "owner": request_principal()}
     # Persist intent before launching. A crash in the launch window reports unknown, never success.
     _save_job(jid, job)
     public_spec = {"job_id": jid, "cwd": str(cwd) if cwd else None}
@@ -2222,12 +2351,17 @@ def view_image(path: str, max_side: int = 1600) -> Image:
     return to_image(f, max_side)
 
 
+def _job_visible(job: dict) -> bool:
+    principal = request_principal()
+    return principal == "owner" or job.get("owner") == principal
+
+
 def _job(job_id: str) -> dict:
     with _jobs_lock:
-        j = JOBS.get((job_id or "").strip())
-    if j is None:
-        raise BridgeError("unknown_job", f"Unknown job_id {job_id!r}. Known jobs: {list(JOBS) or 'none'}")
-    return j
+        job = JOBS.get((job_id or "").strip())
+        if job is None or not _job_visible(job):
+            raise BridgeError("unknown_job", "Background job is unavailable.")
+        return job
 
 
 def _close_job_log(j: dict) -> None:
@@ -2243,7 +2377,7 @@ def job_status(job_id: str = "") -> dict:
     status=unknown means the final exit code could not be recovered; it does NOT mean success."""
     if not job_id:
         with _jobs_lock:
-            jobs = list(JOBS.items())
+            jobs = [(jid, job) for jid, job in JOBS.items() if _job_visible(job)]
         return {"ok": True, "jobs": [_job_state(k, v) for k, v in jobs]}
     job_id = job_id.strip()
     j = _job(job_id)
@@ -2329,10 +2463,7 @@ def read_job_output(job_id: str, cursor: str = "", max_bytes: int = 16000, wait_
             "reset": reset, "has_more": has_more, "status": state["status"], "offset": offset}
 
 
-@mcp.tool()
-@threaded
-def job_stop(job_id: str) -> dict:
-    """Stop a persistent background job and its process tree, verifying PID + creation time after recovery."""
+def _stop_job(job_id: str) -> dict:
     job_id = job_id.strip()
     j = _job(job_id)
     with _jobs_lock:
@@ -2359,6 +2490,28 @@ def job_stop(job_id: str) -> dict:
             _save_job(job_id, j)
         return {"ok": True, "job_id": job_id, "stopped": was_running, "exit_code": j.get("exit_code"),
                 "status": j["status"]}
+
+
+@mcp.tool()
+@threaded
+def job_stop(job_id: str) -> dict:
+    """Stop a persistent background job and its process tree, verifying PID + creation time after recovery."""
+    return _stop_job(job_id)
+
+
+def _panel_jobs() -> dict:
+    with _jobs_lock:
+        jobs = sorted(JOBS.items(), key=lambda item: item[1]["started"], reverse=True)
+        active, previous = [], []
+        for jid, job in jobs:
+            status = job.get("status")
+            if status not in ("completed", "failed", "stopped"):
+                status = _job_state(jid, job)["status"]
+            row = {"job_id": jid, "status": status, "started": job["started"],
+                   "finished": job.get("finished"), "exit_code": job.get("exit_code"),
+                   "owner": job.get("owner") or "owner", "recovered": bool(job.get("recovered"))}
+            (active if status == "running" else previous).append(row)
+        return {"jobs": (active + previous)[:100], "total": len(jobs)}
 
 
 _load_jobs()
@@ -2675,12 +2828,14 @@ if flag("enable_shell"):
                     env_delta: dict[str, str | None] | None = None, stdin_text: str | None = None,
                     window_mode: str = "hidden", background: bool = False, timeout: int = 120,
                     shell_mode: str = "none", env_profile: str = "", resources: list[str] | None = None,
-                    artifacts: list[str] | None = None) -> dict:
+                    artifacts: list[str] | None = None, risk_explanation: str = "") -> dict:
         """Run a native executable with literal argv, child-only environment and UTF-8 stdin.
         Batch files require shell_mode='cmd' and accept only shell-safe arguments.
         Background jobs use job_status/read_job_output/job_stop. Resource paths are cooperative
         exclusive locks. On exit 0, artifact source files are copied to a new job directory and hashed
-        before completion and lock release. Use background=true for multi-minute jobs."""
+        before completion and lock release. Use background=true for multi-minute jobs.
+        Optional risk_explanation is shown only in a local confirmation. Describe the intended effect, affected data,
+        and potential loss in the user's language, without including secrets. It does not authorize execution."""
         argv, env_delta = argv or [], env_delta or {}
         if not 1 <= timeout <= 14400 or window_mode not in {"hidden", "normal"}:
             raise BridgeError("invalid_argument", "Use timeout 1..14400 and window_mode hidden or normal.")
@@ -2701,7 +2856,7 @@ if flag("enable_shell"):
             raise BridgeError("invalid_argument", "Unknown local process environment profile.")
         env = _process_jobs.process_environment(profiles.get(env_profile, {}), env_delta)
         checked = subprocess.list2cmdline([actual, *argv])
-        denied = check_command(checked, wd, redact=True)
+        denied = check_command(checked, wd, redact=True, risk_explanation=risk_explanation)
         if denied:
             return {**denied, "state": "refused", "phase": "policy", "executed": False,
                     "error_code": "process_denied"}
@@ -2736,13 +2891,16 @@ if flag("enable_shell"):
                 "stdout": last(job["log"], 20000), "stderr": last(JOB_DIR / f"{jid}.stderr.log", 8000)}
 
     @mcp.tool()
-    async def run_command(command: str, cwd: str = "", timeout: int = 120, background: bool = False) -> dict:
+    async def run_command(command: str, cwd: str = "", timeout: int = 120, background: bool = False,
+                          risk_explanation: str = "") -> dict:
         """Run a PowerShell command on the user's PC (cargo test, install programs with winget/pip, run scripts...).
         Use background=true for long commands and poll job_status.
         Really dangerous commands (disk formatting, deleting system/user folders, disabling the antivirus...) first show
-        a Yes/No window on the PC; if the user refuses, the result has ran=false - do not retry or work around it."""
+        a confirmation window on the PC; if the user refuses, ran=false. Do not retry or work around a refusal.
+        Optional risk_explanation is shown only in the local confirmation. Explain why the command is needed,
+        what it would change and what could be lost. Leave out secrets. It does not authorize execution."""
         wd = str(P(cwd)) if cwd else str(WORK)
-        denied = await anyio.to_thread.run_sync(lambda: check_command(command, wd))
+        denied = await anyio.to_thread.run_sync(lambda: check_command(command, wd, risk_explanation=risk_explanation))
         if denied:
             return denied
         if IS_WIN:
@@ -4587,6 +4745,30 @@ if IS_WIN and flag("enable_screen"):
     _UI = _cu_module.ComputerUseClient(APP / "server" / "uia_worker.py", LOGS / "uia-worker.log",
                                       timeout=max(3, min(30, float(CFG.get("uia_timeout_sec", 15)))))
 
+    if str(APP / "server") not in sys.path:
+        sys.path.insert(0, str(APP / "server"))
+    _uia_receipts_module = _load_bridge_module("uia_receipts")
+    _UI_RECEIPTS = _uia_receipts_module.UIActionReceipts(LOGS / "uia-operations.sqlite3", SECRET.encode("utf-8"))
+
+    def _ui_request(operation, arguments, timeout=None):
+        return _UI.call(operation, {**arguments, "_owner": request_principal()}, timeout=timeout)
+
+    def _ui_mutation_once(operation, operation_id, arguments, timeout):
+        def dispatch():
+            if not _foreground_lock.acquire(blocking=False):
+                raise BridgeError("foreground_busy", "Another foreground action holds the input slot.")
+            try:
+                if is_paused():
+                    raise BridgeError("paused", "PCBridge was paused before UI Automation dispatch.")
+                if is_read_only():
+                    raise BridgeError("read_only", "PCBridge entered read-only mode before UI Automation dispatch.")
+                return _ui_request(operation, arguments, timeout=timeout)
+            finally:
+                _foreground_lock.release()
+
+        return _UI_RECEIPTS.act(request_principal(), operation_id, arguments, dispatch,
+                                workflow=operation == "run_steps")
+
     @mcp.tool()
     @threaded
     def ui_snapshot(window: str = "", max_nodes: int = 200, max_depth: int = 8,
@@ -4594,9 +4776,9 @@ if IS_WIN and flag("enable_screen"):
         """Read a compact accessibility snapshot of ONE Windows window; no screenshot/vision model required.
         window='' uses the foreground window; a title/exe must identify exactly one window; hwnd:<number> is explicit.
         Returns snapshot_id and element refs, roles, names, states and supported semantic actions.
-        Every new snapshot invalidates older refs (also after worker/server restart or 120 seconds).
+        A newer snapshot from this caller invalidates older refs (also after worker/server restart or 120 seconds).
         max_nodes<=500, max_depth<=15. Password values are masked. Missing/unsupported UI: use screenshot/OCR."""
-        return _UI.call("snapshot", {"window": window, "max_nodes": max_nodes,
+        return _ui_request("snapshot", {"window": window, "max_nodes": max_nodes,
                                    "max_depth": max_depth, "include_bounds": include_bounds})
 
     @mcp.tool()
@@ -4605,7 +4787,7 @@ if IS_WIN and flag("enable_screen"):
         """Search an existing UI snapshot by text/value and exact role (Button, Edit, CheckBox...).
         Returns only matching elements and their refs without dumping the whole tree.
         Searches captured nodes only; a truncated snapshot may miss elements. Does not refresh the window."""
-        return _UI.call("find", {"snapshot_id": snapshot_id, "text": text, "role": role, "limit": limit})
+        return _ui_request("find", {"snapshot_id": snapshot_id, "text": text, "role": role, "limit": limit})
 
     @mcp.tool()
     @threaded
@@ -4615,7 +4797,7 @@ if IS_WIN and flag("enable_screen"):
         Specify text and/or exact role. Time limit 0..30 seconds. An incomplete tree cannot prove absence.
         Read-only observation; every poll invalidates previous snapshots. No mouse/keyboard input."""
         seconds = max(0, min(float(timeout_seconds), 30))
-        return _UI.call("wait", {"window": window, "text": text, "role": role, "present": present,
+        return _ui_request("wait", {"window": window, "text": text, "role": role, "present": present,
                                 "timeout_seconds": seconds, "max_nodes": max_nodes},
                         timeout=seconds + _UI.timeout)
 
@@ -4631,10 +4813,31 @@ if IS_WIN and flag("enable_screen"):
             Optional expect_text verifies visible text after action. Check verification.verified, not only ok.
             Timeout/disconnection can mean the action executed: NEVER blindly retry; observe current state first.
             ui_action is unavailable without the input module and is refused in pause/read-only modes."""
-            return _UI.call("action", {"snapshot_id": snapshot_id, "ref": ref, "action": action,
+            return _ui_request("action", {"snapshot_id": snapshot_id, "ref": ref, "action": action,
                                       "value": value, "expect_text": expect_text, "wait_seconds": wait_seconds},
                             timeout=_UI.timeout + min(10, max(0, float(wait_seconds))))
 
+
+    @mcp.tool()
+    @threaded
+    def ui_operation(operation_id: str) -> dict:
+        """Read your ui_action_once receipt without contacting the Windows UI worker. Receipts survive restarts."""
+        return _UI_RECEIPTS.status(request_principal(), operation_id)
+
+    if flag("enable_input"):
+        @mcp.tool()
+        @threaded
+        def ui_action_once(snapshot_id: str, ref: str, operation_id: str, action: str = "invoke", value: str = "",
+                           expect_text: str = "", wait_seconds: float = 2) -> dict:
+            """Apply one UI Automation action from a fresh snapshot. Reusing an operation ID returns its receipt.
+            Read ui_operation if the response is lost. Inspect the application before any new action after an unknown outcome.
+            Receipts retain status for 24 hours. An unverified goal can mean the input has already executed."""
+            if not 0 <= wait_seconds <= 10:
+                raise BridgeError("invalid_argument", "Use a verification wait between 0 and 10 seconds.")
+            arguments = {"snapshot_id": snapshot_id, "ref": ref, "action": action, "value": value,
+                         "expect_text": expect_text, "wait_seconds": wait_seconds}
+
+            return _ui_mutation_once("action", operation_id, arguments, timeout=_UI.timeout + wait_seconds)
 
     @mcp.tool()
     @threaded
@@ -4643,7 +4846,7 @@ if IS_WIN and flag("enable_screen"):
         """Find live Windows UI elements without a full snapshot dump. Searches up to 5000 nodes, depth <=50.
         Filter by text, exact role and/or automation_id. Returns a NEW snapshot_id and actionable matching refs.
         search_truncated/unreadable_nodes mean the search cannot prove uniqueness or absence."""
-        return _UI.call("find_live", {"window":window,"text":text,"role":role,"automation_id":automation_id,
+        return _ui_request("find_live", {"window":window,"text":text,"role":role,"automation_id":automation_id,
             "exact":exact,"limit":limit,"max_scan":max_scan,"max_depth":max_depth})
 
     @mcp.tool()
@@ -4652,16 +4855,29 @@ if IS_WIN and flag("enable_screen"):
         """Refresh the same window and return only added/changed/removed captured elements plus a ref_map.
         Uses runtime IDs, not tree positions. NEW snapshot_id replaces old refs. partial=true means an incomplete
         capture; removed entries then mean missing from capture, not proof of actual UI disappearance."""
-        return _UI.call("snapshot_diff", {"snapshot_id":snapshot_id,"max_nodes":max_nodes,"max_depth":max_depth})
+        return _ui_request("snapshot_diff", {"snapshot_id":snapshot_id,"max_nodes":max_nodes,"max_depth":max_depth})
 
     @mcp.tool()
     @threaded
     def ui_diagnose(snapshot_id: str = "", ref: str = "", limit: int = 20) -> dict:
         """Explain recent UI failures, ref/window validity, target readiness and a blocking modal window.
         Read-only. Returns recovery hints and bounded operation metadata, without input values."""
-        return _UI.call("diagnose", {"snapshot_id":snapshot_id,"ref":ref,"limit":limit})
+        return _ui_request("diagnose", {"snapshot_id":snapshot_id,"ref":ref,"limit":limit})
 
     if flag("enable_input"):
+        @mcp.tool()
+        @threaded
+        def ui_run_steps_once(window: str, steps: list[dict], operation_id: str,
+                              timeout_seconds: float = 30) -> dict:
+            """Run 1..20 UI Automation steps once. A repeat reports the stored completed steps without acting.
+            For partial or unknown outcomes, use a new observation to decide how to resume. Use ui_operation
+            to read the receipt after a lost response. Step syntax is the same as ui_run_steps."""
+            if not 0 <= timeout_seconds <= 45:
+                raise BridgeError("invalid_argument", "Use a workflow timeout between 0 and 45 seconds.")
+            return _ui_mutation_once("run_steps", operation_id,
+                                     {"window": window, "steps": steps, "timeout_seconds": timeout_seconds},
+                                     timeout=_UI.timeout + timeout_seconds)
+
         @mcp.tool()
         @threaded
         def ui_run_steps(window: str, steps: list[dict], timeout_seconds: float = 30) -> dict:
@@ -4672,7 +4888,7 @@ if IS_WIN and flag("enable_screen"):
             expectation. Returns completed/failed step indexes; there is NO automatic undo or automatic replay.
             Overall time limit <=45 seconds. On timeout/disconnect observe state before continuing."""
             seconds=max(0,min(float(timeout_seconds),45))
-            return _UI.call("run_steps", {"window":window,"steps":steps,"timeout_seconds":seconds},timeout=seconds+_UI.timeout)
+            return _ui_request("run_steps", {"window":window,"steps":steps,"timeout_seconds":seconds},timeout=seconds+_UI.timeout)
 
 
 # --------------------------------------------- owned Playwright browser ----
@@ -4682,8 +4898,50 @@ if flag("enable_browser") and flag("enable_internet"):
         _cu_spec=_cu_import.spec_from_file_location("pcbridge_computer_use",APP/"server"/"computer_use.py")
         _cu_module=_cu_import.module_from_spec(_cu_spec)
         _cu_spec.loader.exec_module(_cu_module)
+    if str(APP / "server") not in sys.path:
+        sys.path.insert(0, str(APP / "server"))
+    from browser_requests import BrowserRequests
+    from operation_receipts import OperationReceiptStore
+
     _BROWSER=_cu_module.ComputerUseClient(APP/"server"/"browser_worker.py",LOGS/"browser-worker.log",timeout=25,
                 worker_args=["--allow-lan"] if ALLOW_LAN_URLS else [],kill_tree=True)
+
+    def _browser_dispatch_policy(write):
+        if is_paused():
+            raise BridgeError("paused", "PCBridge was paused before browser dispatch.")
+        if write and is_read_only():
+            raise BridgeError("read_only", "PCBridge entered read-only mode before browser dispatch.")
+
+    _BROWSER_RECEIPTS = OperationReceiptStore(LOGS / "browser-operations.sqlite3", SECRET.encode("utf-8"),
+                                               "browser", scope_limit=512)
+    _BROWSER_REQUESTS = BrowserRequests(_BROWSER, policy=_browser_dispatch_policy, receipt_store=_BROWSER_RECEIPTS)
+    _BROWSER_READ_OPERATIONS = {"sessions", "tabs", "snapshot", "find", "wait", "diagnostics"}
+
+    def _browser_request(operation, arguments=None, timeout=None):
+        owner = request_principal()
+        if operation in {"open", "session_open"}:
+            arguments = {**(arguments or {}), "_session_limit": _session_limit(owner, "browser_max_active", 4)}
+        return _BROWSER_REQUESTS.call(owner, operation, arguments, timeout=timeout,
+                                      write=operation not in _BROWSER_READ_OPERATIONS)
+
+    @mcp.tool()
+    @threaded
+    def browser_session_open(url: str = "about:blank", headless: bool = True) -> dict:
+        """Open a fresh isolated Chromium context under this client's identity.
+        Returns a session ID and the first page snapshot. Headless keeps Chromium off the desktop."""
+        return _browser_request("session_open", {"url": url, "headless": headless}, timeout=45)
+
+    @mcp.tool()
+    @threaded
+    def browser_sessions() -> dict:
+        """List the isolated Chromium contexts owned by this client."""
+        return _browser_request("sessions")
+
+    @mcp.tool()
+    @threaded
+    def browser_session_close(session_id: str) -> dict:
+        """Close one Chromium context owned by this client, including its pages and temporary downloads."""
+        return _browser_request("session_close", {"session_id": session_id}, timeout=45)
 
     @mcp.tool()
     @threaded
@@ -4692,19 +4950,19 @@ if flag("enable_browser") and flag("enable_internet"):
         Returns an AI accessibility snapshot with refs. Same worker retains its own cookies/tabs until restart.
         headless mode is fixed for this worker session. HTTP(S)/about:blank only; LAN policy follows config.
         Requires enable_browser + enable_internet. First use requires python -m playwright install chromium."""
-        return _BROWSER.call("open",{"url":url,"headless":headless},timeout=45)
+        return _browser_request("open",{"url":url,"headless":headless},timeout=45)
 
     @mcp.tool()
     @threaded
     def browser_tabs() -> dict:
         """List only tabs created by this bridge's browser. Use an explicit page_id for subsequent operations."""
-        return _BROWSER.call("tabs")
+        return _browser_request("tabs")
 
     @mcp.tool()
     @threaded
     def browser_navigate(page_id: str, url: str) -> dict:
         """Navigate an owned browser tab and return a fresh accessibility snapshot. Old refs are invalidated."""
-        return _BROWSER.call("navigate",{"page_id":page_id,"url":url})
+        return _browser_request("navigate",{"page_id":page_id,"url":url})
 
     @mcp.tool()
     @threaded
@@ -4712,30 +4970,48 @@ if flag("enable_browser") and flag("enable_internet"):
         """Read an owned tab's AI accessibility snapshot, including element refs and supported iframe content.
         Returns snapshot_id; use with browser_find/browser_action. New snapshot invalidates prior refs.
         Password values are masked; max_chars<=100000. Truncation/depth may omit controls."""
-        return _BROWSER.call("snapshot",{"page_id":page_id,"max_chars":max_chars,"max_depth":max_depth})
+        return _browser_request("snapshot",{"page_id":page_id,"max_chars":max_chars,"max_depth":max_depth})
 
     @mcp.tool()
     @threaded
     def browser_find(page_id: str, snapshot_id: str, text: str = "", role: str = "", limit: int = 30) -> dict:
         """Return matching lines/refs from an owned tab's existing accessibility snapshot. Exact role, substring text.
         Does not take another snapshot; search covers captured lines only."""
-        return _BROWSER.call("find",{"page_id":page_id,"snapshot_id":snapshot_id,"text":text,"role":role,"limit":limit})
+        return _browser_request("find",{"page_id":page_id,"snapshot_id":snapshot_id,"text":text,"role":role,"limit":limit})
 
     @mcp.tool()
     @threaded
     def browser_wait(page_id: str, text: str, present: bool = True, timeout_seconds: float = 10) -> dict:
         """Wait for visible page text to appear/disappear, then return a fresh snapshot. Time limit <=30 seconds."""
         seconds=max(0,min(float(timeout_seconds),30))
-        return _BROWSER.call("wait",{"page_id":page_id,"text":text,"present":present,"timeout_seconds":seconds},timeout=seconds+25)
+        return _browser_request("wait",{"page_id":page_id,"text":text,"present":present,"timeout_seconds":seconds},timeout=seconds+25)
 
     @mcp.tool()
     @threaded
     def browser_diagnostics(page_id: str = "", limit: int = 30) -> dict:
         """Read bounded console errors, page errors, failed/blocked network requests, HTTP errors and download IDs.
         Only owned browser pages are included. Request headers/bodies are not returned; URLs have query/credentials removed."""
-        return _BROWSER.call("diagnostics",{"page_id":page_id,"limit":limit})
+        return _browser_request("diagnostics",{"page_id":page_id,"limit":limit})
+
+    @mcp.tool()
+    @threaded
+    def browser_operation(session_id: str, operation_id: str) -> dict:
+        """Look up your browser operation after a lost response, without waiting for the browser worker.
+        Receipts retain status for 24 hours, including after the session closes or the bridge restarts."""
+        return _BROWSER_REQUESTS.status(request_principal(), session_id, operation_id)
 
     if flag("enable_input"):
+        @mcp.tool()
+        @threaded
+        def browser_action_once(session_id: str, page_id: str, snapshot_id: str, ref: str, operation_id: str,
+                                action: str = "click", value: str = "", expect_text: str = "") -> dict:
+            """Act once on a ref from a page in your explicit browser session. Choose a fresh operation ID for each intent.
+            Repeating the same ID and arguments returns its receipt without a second action or snapshot. Query
+            browser_operation after a timeout. An unknown outcome requires observing the page before taking more input."""
+            return _BROWSER_REQUESTS.act_once(request_principal(), session_id, operation_id,
+                {"page_id": page_id, "snapshot_id": snapshot_id, "ref": ref, "action": action,
+                 "value": value, "expect_text": expect_text})
+
         @mcp.tool()
         @threaded
         def browser_action(page_id: str, snapshot_id: str, ref: str, action: str = "click",
@@ -4743,7 +5019,7 @@ if flag("enable_browser") and flag("enable_internet"):
             """Act on an owned tab ref: click, fill, check, uncheck, select or press. Playwright auto-waits for readiness.
             Returns new snapshot and verification. Fill/select values and checked state can be verified; expect_text checks
             visible text. On timeout outcome may be unknown: NEVER blindly replay. Requires input module and write mode."""
-            return _BROWSER.call("action",{"page_id":page_id,"snapshot_id":snapshot_id,"ref":ref,
+            return _browser_request("action",{"page_id":page_id,"snapshot_id":snapshot_id,"ref":ref,
                 "action":action,"value":value,"expect_text":expect_text})
 
     @mcp.tool()
@@ -4756,7 +5032,7 @@ if flag("enable_browser") and flag("enable_internet"):
         f.parent.mkdir(parents=True,exist_ok=True)
         cid=record_change("browser_download",[f])
         if not cid:raise BridgeError("backup_failed","Cannot save undo backup; download destination was not changed")
-        result=_BROWSER.call("download_save",{"download_id":download_id,"path":str(f)},timeout=60)
+        result=_browser_request("download_save",{"download_id":download_id,"path":str(f)},timeout=60)
         result["change_id"]=cid
         return result
 
@@ -4777,7 +5053,7 @@ if flag("enable_browser") and flag("enable_internet"):
             cid=record_change("browser_trace",[f])
             if not cid:raise BridgeError("backup_failed","Cannot save trace undo backup")
             arguments["path"]=str(f)
-        result=_BROWSER.call("trace",arguments,timeout=45)
+        result=_browser_request("trace",arguments,timeout=45)
         if cid:result["change_id"]=cid
         return result
 
@@ -4785,19 +5061,139 @@ if flag("enable_browser") and flag("enable_internet"):
     @threaded
     def browser_close(page_id: str) -> dict:
         """Close a tab owned by the bridge; never closes user's existing browser tabs."""
-        return _BROWSER.call("close_page",{"page_id":page_id})
+        return _browser_request("close_page",{"page_id":page_id})
+
+
+# -------------------------------------------------- experimental Win32 Desktop ----
+if IS_WIN and flag("enable_background_desktop"):
+    if str(APP / "server") not in sys.path:
+        sys.path.insert(0, str(APP / "server"))
+    from desktop_sessions import DesktopSessions
+    from operation_receipts import OperationReceiptStore
+
+    _DESKTOPS = DesktopSessions(CFG.get("background_desktop_apps"), APP / "server" / "desktop_worker.py", LOGS,
+                                receipt_store=OperationReceiptStore(LOGS / "desktop-operations.sqlite3",
+                                                                    SECRET.encode("utf-8"), "desktop", scope_limit=512))
+
+    @mcp.tool()
+    def desktop_apps() -> dict:
+        """List approved applications available to this client on experimental Win32 Desktops."""
+        return _DESKTOPS.apps(request_principal())
+
+    @mcp.tool()
+    @threaded
+    def desktop_session_open(app: str) -> dict:
+        """Start an approved application on its own Win32 desktop. The job ends when the session closes."""
+        owner = request_principal()
+        return _DESKTOPS.open(app, owner, session_limit=_session_limit(owner, "desktop_max_active", 2))
+
+    @mcp.tool()
+    def desktop_sessions() -> dict:
+        """List the client's experimental Win32 Desktop sessions."""
+        return _DESKTOPS.list(request_principal())
+
+    @mcp.tool()
+    @threaded
+    def desktop_windows(session_id: str) -> dict:
+        """List top-level windows belonging to this client's desktop job."""
+        return _DESKTOPS.observe(session_id, request_principal(), "windows")
+
+    @mcp.tool()
+    @threaded
+    def desktop_snapshot(session_id: str, window: str = "", max_nodes: int = 200, max_depth: int = 8) -> dict:
+        """Read the UI Automation tree of a job window. Use hwnd:<number> if several windows are present."""
+        return _DESKTOPS.observe(session_id, request_principal(), "snapshot",
+                                 {"window": window, "max_nodes": max_nodes, "max_depth": max_depth})
+
+    @mcp.tool()
+    @threaded
+    def desktop_wait(session_id: str, window: str = "", text: str = "", role: str = "",
+                     present: bool = True, timeout_seconds: float = 10, max_nodes: int = 200,
+                     max_depth: int = 8) -> dict:
+        """Wait for a window or visible element in the owned desktop session, then return fresh snapshot refs.
+        Use a title to wait for a window at startup. Use text and/or role for element conditions.
+        To confirm absence inside the window, set present=false. Incomplete trees cannot prove absence.
+        The wait budget is 0..30 seconds. This tool only observes and is available in read-only mode."""
+        if not 0 <= timeout_seconds <= 30:
+            raise BridgeError("invalid_argument", "Use a wait budget between 0 and 30 seconds.")
+        return _DESKTOPS.observe(session_id, request_principal(), "wait", {
+            "window": window, "text": text, "role": role, "present": present,
+            "timeout_seconds": timeout_seconds, "max_nodes": max_nodes, "max_depth": max_depth,
+        }, wait_seconds=timeout_seconds)
+
+    if flag("enable_input"):
+        @mcp.tool()
+        @threaded
+        def desktop_lease_acquire(session_id: str, seconds: int = 30, renew_fence: int | None = None) -> dict:
+            """Reserve input on your desktop session for 1–120 seconds. Pass the current fence to renew.
+            Once a lease is used, all future actions in this session require a current fence.
+            An expired lease's fence is never reused. Observe or read receipts without a lease."""
+            return _DESKTOPS.acquire_lease(session_id, request_principal(), seconds, renew_fence)
+
+        @mcp.tool()
+        @threaded
+        def desktop_lease_release(session_id: str, fence: int) -> dict:
+            """Release a current input lease for your session. Acquire a new lease to send further input."""
+            return _DESKTOPS.release_lease(session_id, request_principal(), fence)
+
+        @mcp.tool()
+        @threaded
+        def desktop_action_leased(session_id: str, snapshot_id: str, ref: str, operation_id: str, fence: int,
+                                  action: str = "invoke", value: str = "", expect_text: str = "") -> dict:
+            """Apply a UIA pattern under the current input lease. Use desktop_operation after a lost reply."""
+            return _DESKTOPS.act(session_id, request_principal(), operation_id,
+                                 {"snapshot_id": snapshot_id, "ref": ref, "action": action,
+                                  "value": value, "expect_text": expect_text}, fence=fence)
+
+        @mcp.tool()
+        @threaded
+        def desktop_action(session_id: str, snapshot_id: str, ref: str, operation_id: str,
+                           action: str = "invoke", value: str = "", expect_text: str = "") -> dict:
+            """Apply a UIA pattern using a fresh snapshot ref. Check action_executed and verification.status.
+            A dispatched action can return ok=false when its expected result could not be confirmed.
+            Reusing operation_id returns the receipt without invoking the action again."""
+            return _DESKTOPS.act(session_id, request_principal(), operation_id,
+                                 {"snapshot_id": snapshot_id, "ref": ref, "action": action,
+                                  "value": value, "expect_text": expect_text})
+
+    @mcp.tool()
+    @threaded
+    def desktop_operation(session_id: str, operation_id: str) -> dict:
+        """Read your Win32 Desktop action receipt without sending input. Receipts survive restarts for 24 hours.
+        If status is finished, inspect receipt.ok and receipt.outcome."""
+        return _DESKTOPS.operation(session_id, request_principal(), operation_id)
+
+    @mcp.tool()
+    @threaded
+    def desktop_session_recover(session_id: str) -> dict:
+        """Open a fresh instance of an approved application after this caller's desktop session exits or is lost.
+        Repeating recovery returns the existing replacement. Use new refs for the replacement; no action is replayed."""
+        session_owner = request_principal()
+        return _DESKTOPS.recover(session_id, session_owner,
+                                 session_limit=_session_limit(session_owner, "desktop_max_active", 2))
+
+    @mcp.tool()
+    @threaded
+    def desktop_session_close(session_id: str) -> dict:
+        """Close the session and the application processes in its job."""
+        return _DESKTOPS.close(session_id, request_principal())
 
 
 # -------------------------------------------------- frame-bound computer use ----
 def _computer_backends():
     import importlib.util
     screen = IS_WIN and flag("enable_screen")
+    background_desktop = IS_WIN and flag("enable_background_desktop")
     browser = flag("enable_browser") and flag("enable_internet")
+    allows_input = flag("enable_input") and not is_read_only() and not is_paused()
     return {
         "native": {"available": IS_WIN, "tools": ["list_windows", "observe_focus"] if screen else []},
-        "uia": {"available": screen, "tools": ["ui_find_live", "ui_run_steps"] if screen else []},
-        "browser": {"available": browser, "owned_pages_only": True},
-        "visual": {"available": screen, "input_enabled": screen and flag("enable_input"),
+        "uia": {"available": screen, "input_enabled": screen and allows_input, "tools": ["ui_find_live", "ui_run_steps"] if screen else []},
+        "browser": {"available": browser, "input_enabled": browser and allows_input, "owned_pages_only": True},
+        "win32_desktop": {"available": background_desktop, "experimental": True,
+                          "input_enabled": background_desktop and allows_input,
+                          "requires_approved_app": True, "observation": "uia"},
+        "visual": {"available": screen, "input_enabled": screen and allows_input,
                    "capture_methods": ["screen", "window"] + (["dxgi"] if screen and flag("enable_dxgi_capture")
                        and importlib.util.find_spec("windows_capture") else []),
                    "vision_adapter": ("configured" if Path(CFG.get("vision_adapter_path") or ".").is_file()
@@ -4810,6 +5206,221 @@ def computer_capabilities() -> dict:
     """List available ways to observe or act and the status of optional capture and vision backends."""
     return {"backends": _computer_backends(), "paused": is_paused(), "read_only": is_read_only(),
             "active_operation": _VIS.active if "_VIS" in globals() else None}
+
+
+@mcp.tool()
+@threaded
+def computer_isolation_status() -> dict:
+    """Check whether Windows Child Sessions or local Windows Sandbox launchers are available."""
+    module = _load_bridge_module("windows_isolation")
+    return module.isolation_status()
+
+
+@mcp.tool()
+@threaded
+def computer_sessions() -> dict:
+    """List the caller's browser and Win32 Desktop sessions with backend status. Does not start a worker."""
+    owner = request_principal()
+    sessions, status = [], {}
+    browser = globals().get("_BROWSER_REQUESTS")
+    desktops = globals().get("_DESKTOPS")
+    if browser is not None:
+        try:
+            result = browser.call(owner, "sessions", start=False)
+            sessions.extend(result["sessions"])
+            status["browser"] = "ok"
+        except ValueError as exc:
+            status["browser"] = getattr(exc, "code", "unavailable")
+    if desktops is not None:
+        result = desktops.list(owner)
+        sessions.extend(result["sessions"])
+        status["win32_desktop"] = "ok"
+    return {"sessions": sessions, "backends": status}
+
+
+@mcp.tool()
+@threaded
+def computer_receipt(operation_id: str, backend: str = "", session_id: str = "") -> dict:
+    """Find your retained UI Automation, browser or Win32 Desktop action receipts without sending input.
+    Specify only operation_id to search permitted backends, or narrow the lookup by backend (uia, browser,
+    win32_desktop) or session_id. Only backends allowed by the client's receipt-read permissions are queried.
+    Session discovery uses up to 20 matches per backend and reports truncation. Multiple matches mean
+    the ID was reused. For an unknown outcome, observe the application before issuing a new action."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", operation_id):
+        raise BridgeError("invalid_operation_id", "Use 1 to 64 ASCII letters, digits, dots, hyphens or underscores.")
+    if backend not in {"", "uia", "browser", "win32_desktop"}:
+        raise BridgeError("invalid_argument", "Choose uia, browser or win32_desktop.")
+
+    owner = request_principal()
+    profile = _client_profile(owner)
+    matches, sources = [], {}
+    limit = 20
+    missing = {"ui_operation_missing", "unknown_browser_operation", "desktop_operation_missing",
+               "desktop_session_missing", "invalid_operation_id"}
+    for name, query_tool, manager_name in (
+            ("uia", "ui_operation", "_UI_RECEIPTS"),
+            ("browser", "browser_operation", "_BROWSER_REQUESTS"),
+            ("win32_desktop", "desktop_operation", "_DESKTOPS")):
+        if (backend and name != backend) or (name == "uia" and session_id):
+            continue
+        manager = globals().get(manager_name)
+        if manager is None or not _profile_allows(profile, "tools", query_tool):
+            continue
+        sources[name] = "ok"
+        try:
+            if name == "uia":
+                sessions = [None]
+            elif session_id:
+                sessions = [session_id]
+            else:
+                sessions = manager.receipt_store.sessions_for(owner, operation_id, limit + 1)
+            if len(sessions) > limit:
+                sources[name] = "truncated"
+        except ValueError as error:
+            sources[name] = getattr(error, "code", "unavailable")
+            continue
+
+        for sid in sessions[:limit]:
+            try:
+                if name == "win32_desktop":
+                    result = manager.operation(sid, owner, operation_id, summary=True)
+                    state, receipt = result["status"], result["receipt"]
+                else:
+                    args = (owner, operation_id) if sid is None else (owner, sid, operation_id)
+                    receipt = manager.status(*args)["operation"]
+                    state = receipt["state"]
+            except ValueError as error:
+                code = getattr(error, "code", "unavailable")
+                if code not in missing:
+                    sources[name] = code
+                continue
+            matches.append({"backend": name, "session_id": sid, "state": state, "receipt": receipt})
+    return {"operation_id": operation_id, "matches": matches, "backends": sources}
+
+
+_automation_router = _load_bridge_module("automation_router")
+
+
+@mcp.tool()
+def computer_plan(target: str, intent: str = "observe", avoid_physical_input: bool = True,
+                  avoid_focus: bool = True) -> dict:
+    """Rank available backends without acting. Choose target browser, desktop, win32_desktop or native and intent observe or act."""
+    return _automation_router.plan(_computer_backends(), target, intent, avoid_physical_input, avoid_focus)
+
+
+@mcp.tool()
+@threaded
+def computer_plan_history(target: str, intent: str = "observe", avoid_physical_input: bool = True,
+                          avoid_focus: bool = True) -> dict:
+    """Rank already permitted backends from recent successful or failed calls in your own history.
+    This is advisory and never executes an action. With sparse data it keeps the deterministic order."""
+    plan = _automation_router.plan(_computer_backends(), target, intent, avoid_physical_input, avoid_focus)
+    owner = request_principal()
+    profile = _client_profile(owner)
+    candidates = [entry for entry in plan["candidates"] if _profile_allows(profile, "tools", entry["tool"])]
+    events = _diagnostics_module.recent_diagnostics(_diagnostics.path, principal=owner)
+    return _automation_router.rank_by_history(candidates, events, cutoff=time.time() - 7 * 86400)
+
+
+def extension_registry():
+    if str(APP / "server") not in sys.path:
+        sys.path.insert(0, str(APP / "server"))
+    from extensions import Extensions
+    return Extensions(ROOT)
+
+
+def _skill_allowed(profile, skill_id):
+    plugin, separator, _ = skill_id.partition("/")
+    return (_profile_allows(profile, "skills", skill_id)
+            and (not separator or _profile_allows(profile, "plugins", plugin)))
+
+
+@mcp.tool()
+@threaded
+def skills_list() -> dict:
+    """List enabled instructions from locally imported skills and portable plugins."""
+    profile = _client_profile(request_principal())
+    return {"skills": [record for record in extension_registry().skills() if _skill_allowed(profile, record["id"])]}
+
+
+@mcp.tool()
+@threaded
+def skill_read(skill_id: str) -> dict:
+    """Read an enabled skill as external instructions. Import never grants script execution."""
+    if not _skill_allowed(_client_profile(request_principal()), skill_id):
+        raise BridgeError("skill_not_granted", "Skill is unavailable in this client's profile.")
+    return extension_registry().skill(skill_id)
+
+
+@mcp.tool()
+@threaded
+def plugins_list() -> dict:
+    """List enabled portable plugin packages and discovered components."""
+    profile = _client_profile(request_principal())
+    results = []
+    for record in extension_registry().list("plugin", enabled_only=True):
+        if _profile_allows(profile, "plugins", record["name"]):
+            skills = [skill for skill in record["skills"] if _skill_allowed(profile, record["name"] + "/" + skill["name"])]
+            results.append({**record, "skills": skills})
+    return {"plugins": results}
+
+
+def _require_plugin_access(plugin):
+    if not _profile_allows(_client_profile(request_principal()), "plugins", plugin):
+        raise BridgeError("plugin_not_granted", "Plugin is unavailable in this client's profile.")
+
+
+@mcp.tool()
+async def plugin_tools(plugin: str, server: str) -> dict:
+    """List tools on an enabled plugin server, filtered to this client's local grant."""
+    _require_plugin_access(plugin)
+    registry = extension_registry()
+    from external_mcp import ExternalMCP
+
+    return await ExternalMCP(registry, CFG).run(plugin, server, request_principal())
+
+
+@mcp.tool()
+async def plugin_call(plugin: str, server: str, tool: str, arguments: dict, operation_id: str) -> dict:
+    """Call one explicitly granted tool. Repeating an operation ID reports the previous outcome."""
+    _require_plugin_access(plugin)
+    registry = extension_registry()
+    from external_mcp import ExternalMCP
+
+    return await ExternalMCP(registry, CFG).run(plugin, server, request_principal(),
+                                                tool=tool, arguments=arguments, operation_id=operation_id)
+
+
+if IS_WIN and flag("enable_background_desktop") and flag("enable_internet") and CFG.get("desktop_peers"):
+    from desktop_peers import component as peer_component, peer_entry, resolve_peer
+
+    @mcp.tool()
+    async def desktop_peer_handoff(session_id: str, peer: str, operation_id: str) -> dict:
+        """Start the mapped application on an approved PCBridge peer. The source session stays open.
+        A repeated operation ID returns its receipt. The destination gets a new session and new UI refs."""
+        owner = request_principal()
+        source_app = _DESKTOPS.application(session_id, owner)
+        plugin, server, destination_app = resolve_peer(CFG, peer, owner, source_app)
+        _require_plugin_access(plugin)
+        registry = extension_registry()
+        from external_mcp import ExternalMCP
+
+        receipt = await ExternalMCP(registry, CFG).desktop_handoff(
+            plugin, server, owner, peer, session_id, destination_app, operation_id)
+        return {**receipt, "source_session_id": session_id, "peer": peer, "destination_app": destination_app}
+
+    @mcp.tool()
+    @threaded
+    def desktop_peer_operation(peer: str, operation_id: str) -> dict:
+        """Read your retained handoff receipt without reopening an application, even after the source closed."""
+        owner = request_principal()
+        plugin, server = peer_component(peer_entry(CFG, peer, owner))
+        _require_plugin_access(plugin)
+        registry = extension_registry()
+        from external_mcp import ExternalMCP
+
+        receipt = ExternalMCP(registry, CFG).desktop_handoff_status(plugin, server, owner, peer, operation_id)
+        return {**receipt, "peer": peer, "ok": True}
 
 
 @mcp.tool()
@@ -4898,7 +5509,7 @@ if IS_WIN and flag("enable_screen"):
     except (OSError, ValueError):
         _history = []
     _VIS = _visual.Controller(_visual.WindowsDesktop(globals()), _visual_policy, _approve_visual,
-        history=_history if isinstance(_history, list) else [],
+        history=_history if isinstance(_history, list) else [], principal=request_principal,
         persist=lambda data: atomic_write(_operation_file, json.dumps(data, ensure_ascii=False).encode("utf-8")))
 
     def _visual_result(fn):
@@ -4970,9 +5581,11 @@ if IS_WIN and flag("enable_screen"):
     def computer_verify(window_ref: str, capture_id: str, region: list[int] | None = None,
                         condition: str = "changed", threshold: int = 1) -> CallToolResult:
         """Compare a fresh frame with the referenced capture. A region uses capture-pixel left/top/right/bottom.
-        Reports the pixel evidence and the new image. Use UIA or browser verification for application semantics."""
+        Reports changed pixel fraction, enclosing bounds and clustered changed regions in full capture coordinates.
+        Very fragmented changes are represented by the enclosing bounds. The response includes the new image.
+        Use UIA or browser verification for application semantics."""
         frame = _VIS.frame(window_ref, capture_id)
-        verification, fresh = _VIS.verify(frame, region, condition, threshold)
+        verification, fresh = _VIS.verify(frame, region, condition, threshold, detailed=True)
         return _visual.result({"ok": verification["verified"], "postcondition_verified": verification["verified"],
                                "verification": verification, "observation": fresh["public"]}, fresh)
 
@@ -5032,8 +5645,8 @@ def computer_find_target(text: str = "", role: str = "", mode: str = "auto", win
     if page_id or mode == "browser":
         if mode not in {"auto", "browser"} or "browser_snapshot" not in globals() or not page_id:
             raise BridgeError("backend_unavailable", "The owned browser route needs an explicit page_id.")
-        snapshot = _BROWSER.call("snapshot", {"page_id": page_id, "max_chars": 40000, "max_depth": 12})
-        found = _BROWSER.call("find", {"page_id": page_id, "snapshot_id": snapshot["snapshot_id"],
+        snapshot = _browser_request("snapshot", {"page_id": page_id, "max_chars": 40000, "max_depth": 12})
+        found = _browser_request("find", {"page_id": page_id, "snapshot_id": snapshot["snapshot_id"],
                                       "text": text, "role": role, "limit": limit})
         return {**found, "backend": "browser", "reason": "Explicit owned browser page.", "next_tool": "browser_action"}
     if "_VIS" not in globals() or not window_ref:
@@ -5045,7 +5658,7 @@ def computer_find_target(text: str = "", role: str = "", mode: str = "auto", win
                 "geometry": _VIS.desktop.geometry(hwnd), "foreground": _VIS.desktop.foreground() == hwnd}
     if mode in {"auto", "uia"} and (text or role or mode == "uia"):
         try:
-            found = _UI.call("find_live", {"window": f"hwnd:{hwnd}", "text": text, "role": role,
+            found = _ui_request("find_live", {"window": f"hwnd:{hwnd}", "text": text, "role": role,
                                            "exact": exact, "limit": limit, "max_scan": 3000, "max_depth": 30})
         except _cu_module.ComputerUseError as exc:
             if mode == "uia" or exc.code not in {"window_not_found", "uia_unavailable", "uia_error"}:
@@ -5063,7 +5676,7 @@ def computer_find_target(text: str = "", role: str = "", mode: str = "auto", win
                                                 _visual_adapter_call if _adapter else None)
     if include_semantic:
         try:
-            snapshot = _UI.call("snapshot", {"window": f"hwnd:{hwnd}", "include_bounds": True,
+            snapshot = _ui_request("snapshot", {"window": f"hwnd:{hwnd}", "include_bounds": True,
                                              "max_nodes": 100, "max_depth": 8})
             ox, oy, rx, by = frame["public"]["screen_rect"]
             transform = frame["public"]["transform"]
@@ -5089,54 +5702,6 @@ def computer_find_target(text: str = "", role: str = "", mode: str = "auto", win
     return {"backend": "visual", "reason": "Visual mode requested or no semantic target matched.",
             "capture_id": capture_id, "window_ref": window_ref, "coordinate_space": "capture",
             "candidates": candidates[:limit], "requires_visual_review": True, "diagnostics": diagnostics}
-
-# ------------------------------------------------------------------ auth ----
-class TokenAuth:
-    """ASGI middleware: every request needs the token - 'Authorization: Bearer <token>' (or X-API-Key: <token>)."""
-
-    def __init__(self, app, token: str):
-        self.app = app
-        self.token = token.encode()
-
-    def ok(self, headers: dict) -> bool:
-        cands = []
-        a = headers.get("authorization", "").strip()
-        if a:
-            cands.append(a[7:].strip() if a.lower().startswith("bearer ") else a)
-        for k in ("x-api-key", "api-key", "x-pcbridge-token"):
-            if headers.get(k):
-                cands.append(headers[k].strip())
-        return any(hmac.compare_digest(c.encode(), self.token) for c in cands)
-
-    async def __call__(self, scope, receive, send):
-        kind = scope["type"]
-        path = scope.get("path", "")
-        if kind not in ("http", "websocket") or path.startswith("/.well-known/") or path.startswith("/oauth/"):
-            return await self.app(scope, receive, send)
-        headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers") or []}
-        if self.ok(headers):
-            return await self.app(scope, receive, send)
-        who = headers.get("x-forwarded-for") or (scope.get("client") or ("?",))[0]
-        log.warning("AUTH FAIL %s %s from %s", scope.get("method", kind), scope.get("path"), who)
-        if kind == "websocket":
-            await send({"type": "websocket.close", "code": 1008})
-            return
-        body = b'{"error":"unauthorized","hint":"send the PC Bridge token: Authorization: Bearer <token>"}'
-        host = headers.get("x-forwarded-host") or headers.get("x-original-host")
-        if not host:
-            ngrok_dom = str(CFG.get("ngrok_domain") or "").strip()
-            if ngrok_dom and (headers.get("x-forwarded-proto") == "https" or headers.get("ngrok-agent-ips")):
-                host = ngrok_dom.replace("https://", "").replace("http://", "").rstrip("/")
-        if not host:
-            host = headers.get("host")
-        proto = headers.get("x-forwarded-proto") or ("https" if host and ("ngrok" in host or ":443" in host) else "http")
-        base_url = f"{proto}://{host}" if host else ""
-        www_auth = f'Bearer realm="PC Bridge", resource_metadata="{base_url}/.well-known/oauth-protected-resource"'.encode("latin-1") if base_url else b'Bearer realm="PC Bridge"'
-        await send({"type": "http.response.start", "status": 401,
-                    "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()),
-                                (b"www-authenticate", www_auth)]})
-        await send({"type": "http.response.body", "body": body})
-
 
 # --------------------------------------------- control port (local only) ----
 # The web panel (supervisor.py + panel.py) asks the server to undo changes through this port. It listens on
@@ -5164,6 +5729,22 @@ def control_undo(ids: list) -> dict:
     return {"done": done, "failed": failed}
 
 
+async def _run_diagnostic_probe(name, arguments):
+    tool = next((tool for tool in await mcp.list_tools() if tool.name == name), None)
+    if tool is None:
+        return {"error": "Инструмент недоступен"}
+    if arguments.keys() - tool.input_schema.get("properties", {}).keys():
+        return {"error": "Проверьте имена аргументов по схеме инструмента"}
+    replay = _diagnostic_replay.set(True)
+    try:
+        result = await mcp.call_tool(name, arguments)
+    except ToolError:
+        return {"error": "Проверьте аргументы по схеме инструмента"}
+    finally:
+        _diagnostic_replay.reset(replay)
+    return {"result": result.structured_content}
+
+
 def start_control():
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -5185,13 +5766,85 @@ def start_control():
             if not hmac.compare_digest(self.headers.get("X-PCB-Key", ""), key):
                 return self._send(403, {"error": "bad key"})
             try:
-                n = min(int(self.headers.get("Content-Length") or 0), 1_000_000)
-                data = json.loads(self.rfile.read(n) or b"{}")
-            except ValueError:
+                n = int(self.headers.get("Content-Length") or 0)
+                if n < 0:
+                    raise ValueError("negative length")
+                if self.path == "/diagnostic-replay" and n > _diagnostics_module.REPLAY_BODY_LIMIT:
+                    return self._send(413, {"error": "Запрос слишком большой"})
+                data = json.loads(self.rfile.read(min(n, 1_000_000)) or b"{}")
+            except (ValueError, RecursionError):
                 return self._send(400, {"error": "bad json"})
             if self.path == "/ping":
                 return self._send(200, {"ok": True, "version": VERSION, "running": _running["n"],
                                         "last_call": _last_call["t"]})
+            if self.path == "/tool-catalog":
+                tools = anyio.run(mcp.list_tools)
+                return self._send(200, {"tools": [
+                    {**tool.model_dump(mode="json", by_alias=True, exclude_none=True),
+                     "read_only": tool.name in READ_TOOLS,
+                     "replayable": tool.name in _DIAGNOSTIC_REPLAY_TOOLS} for tool in tools
+                ]})
+            if self.path == "/diagnostic-replay":
+                name = data.get("name") if isinstance(data, dict) else None
+                if not isinstance(name, str) or name not in _DIAGNOSTIC_REPLAY_TOOLS:
+                    return self._send(403, {"error": "Повтор этого инструмента недоступен"})
+                arguments = data.get("arguments")
+                if not isinstance(arguments, dict):
+                    return self._send(400, {"error": "Аргументы должны быть объектом JSON"})
+                return self._send(200, anyio.run(_run_diagnostic_probe, name, arguments))
+            if self.path == "/desktop-sessions":
+                desktops = globals().get("_DESKTOPS")
+                sessions = desktops.list(include_operations=True) if desktops else {"sessions": []}
+                return self._send(200, {"enabled": desktops is not None,
+                                        "input_enabled": flag("enable_input"), **sessions})
+            if self.path == "/desktop-session-input":
+                desktops = globals().get("_DESKTOPS")
+                session_id = data.get("session_id") if isinstance(data, dict) else None
+                paused = data.get("paused") if isinstance(data, dict) else None
+                if (desktops is None or not isinstance(session_id, str)
+                        or not re.fullmatch(r"[0-9a-f]{32}", session_id) or type(paused) is not bool):
+                    return self._send(400, {"error": "Проверьте идентификатор сессии и режим ввода"})
+                try:
+                    return self._send(200, desktops.set_input_paused(session_id, paused))
+                except ValueError:
+                    return self._send(200, {"error": "Сессия уже завершена или недоступна"})
+            if self.path == "/desktop-session-close":
+                desktops = globals().get("_DESKTOPS")
+                session_id = data.get("session_id") if isinstance(data, dict) else None
+                if desktops is None or not isinstance(session_id, str):
+                    return self._send(400, {"error": "Сессия недоступна"})
+                try:
+                    return self._send(200, desktops.close(session_id, "owner", local_owner=True))
+                except ValueError:
+                    return self._send(409, {"error": "Сессия занята или уже закрыта"})
+            if self.path == "/jobs":
+                return self._send(200, _panel_jobs())
+            if self.path == "/job-stop":
+                job_id = data.get("job_id") if isinstance(data, dict) else None
+                if not isinstance(job_id, str) or not re.fullmatch(r"[0-9a-f]{32}", job_id):
+                    return self._send(400, {"error": "Некорректный идентификатор задачи"})
+                try:
+                    return self._send(200, _stop_job(job_id))
+                except BridgeError:
+                    return self._send(200, {"error": "Задача недоступна или не удалось завершить её процессы"})
+            if self.path in ("/browser-sessions", "/browser-session-close"):
+                browser = globals().get("_BROWSER")
+                close = self.path == "/browser-session-close"
+                if browser is None or browser.proc is None or browser.proc.poll() is not None:
+                    return self._send(200, {"error": "Сессия недоступна"} if close else {"sessions": []})
+                requests = globals()["_BROWSER_REQUESTS"]
+                owner, operation, args = "owner", "session_inventory", {}
+                if close:
+                    args = data if isinstance(data, dict) else {}
+                    session_id, owner = args.get("session_id"), args.get("owner")
+                    if (not isinstance(session_id, str) or not re.fullmatch(r"default|[0-9a-f]{32}", session_id)
+                            or not isinstance(owner, str) or not re.fullmatch(r"owner|pcbridge-[0-9a-f]{32}", owner)):
+                        return self._send(400, {"error": "Некорректный идентификатор сессии"})
+                    operation, args = "session_close", {"session_id": session_id}
+                try:
+                    return self._send(200, requests.call(owner, operation, args, timeout=browser.timeout, start=False))
+                except ValueError:
+                    return self._send(200, {"error": "Сессия недоступна или браузер занят"})
             if self.path == "/undo":
                 ids = data.get("ids") or []
                 if not isinstance(ids, list) or not ids:
@@ -5208,21 +5861,35 @@ def start_control():
     return srv
 
 
+def make_http_app():
+    from http_policy import HTTPPolicy
+    from mcp_protocol import MCP_REQUEST_LIMIT
+    from oauth import OAuthProvider, TokenAuth
+    from oauth_store import OAuthStore
+
+    if not SECRET or any(char.isspace() for char in SECRET):
+        raise ValueError("Configure a non-empty PCBridge token without whitespace.")
+    security = TransportSecuritySettings(enable_dns_rebinding_protection=True)
+    app = mcp.streamable_http_app(streamable_http_path=MCP_PATH, stateless_http=True, json_response=True,
+                                 max_request_body_size=MCP_REQUEST_LIMIT, transport_security=security)
+    if TOKEN_AUTH:
+        store = OAuthStore(ROOT / "oauth.sqlite3", SECRET)
+        app = OAuthProvider(TokenAuth(app, SECRET, store), SECRET, store)
+    return HTTPPolicy(app, PORT, CFG.get("public_origin") or CFG.get("ngrok_domain"),
+                      LOGS / "tunnel-origin.txt", security)
+
+
 # ------------------------------------------------------------------ main ----
 if __name__ == "__main__":
-    start_control()
     import uvicorn
 
-    app = mcp.streamable_http_app()
-    if TOKEN_AUTH:
-        app = TokenAuth(app, SECRET)
-    from oauth import OAuthProvider
-    app = OAuthProvider(app, SECRET, CFG)
+    app = make_http_app()
+    start_control()
     where = f"{MCP_PATH} (token in the Authorization header)" if TOKEN_AUTH else "/<secret>/mcp (secret in the URL)"
     print(f"PC Bridge {VERSION} on http://127.0.0.1:{PORT}{where} | modules: files code {' '.join(MODULES)}",
           flush=True)
     log.info("START %s auth=%s modules=%s workspace=%s", VERSION, "token" if TOKEN_AUTH else "url", MODULES, WORK)
     if not TOKEN_AUTH:
         log.warning("Old secret-in-URL mode: consider token auth (SETTINGS.bat)")
-    # In the old mode the secret is part of every request path, so the per-request access log is switched off
-    uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="info", access_log=TOKEN_AUTH)
+    # OAuth query strings and legacy endpoint paths can include credentials.
+    uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="info", access_log=False, proxy_headers=False)

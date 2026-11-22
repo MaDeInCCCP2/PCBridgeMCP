@@ -1,0 +1,33 @@
+name: Windows tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  clean-install:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test clean release archive
+        shell: powershell
+        run: |
+          git archive --format=zip -o pcbridge.zip HEAD
+          Expand-Archive -LiteralPath pcbridge.zip -DestinationPath release
+          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File release\setup.ps1 -Mode test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify Chromium session isolation under load
+        shell: powershell
+        working-directory: release
+        run: |
+          $python = '.\.venv\Scripts\python.exe'
+          & $python -m playwright install chromium
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $python tools\benchmark_computer_use.py --scenario browser-concurrency
+          exit $LASTEXITCODE

@@ -76,6 +76,34 @@ class Protocol(unittest.TestCase):
         self.assertNotIn('bounds',r['matches'][0])
         self.assertIn('set_value',r['matches'][0]['actions'])
 
+    def test_action_verification_preserves_snapshot_depth(self):
+        branch = [f"group-{depth}" for depth in range(1, 10)]
+        for depth, element in enumerate(branch, 1):
+            self.b.nodes[element] = node("", role="Group")
+            self.b.runtimes[element] = (100 + depth,)
+        self.b.nodes["confirmation"] = node("", role="Text")
+        self.b.runtimes["confirmation"] = (120,)
+        original_children = self.b.children
+        original_act = self.b.act
+
+        def children(element):
+            if element == "root":
+                return original_children(element) + branch[:1]
+            if element in branch:
+                depth = branch.index(element) + 1
+                return branch[depth:depth + 1] or ["confirmation"]
+            return original_children(element)
+
+        def invoke(element, action, value):
+            original_act(element, action, value)
+            self.b.nodes["confirmation"]["name"] = "Saved below default depth"
+
+        with patch.object(self.b, "children", children), patch.object(self.b, "act", invoke):
+            self.snap = self.s.snapshot(max_depth=12)
+            result = self.act(expect_text="Saved below default depth", wait_seconds=0)
+        self.assertEqual(result["verification"]["status"], "verified")
+        self.assertTrue(self.s.find(result["snapshot"]["snapshot_id"], "Saved below default depth")["matches"])
+
     def test_new_snapshot_invalidates_old_refs(self):
         self.s.snapshot()
         with self.assertRaises(W.UIError) as e: self.act()
@@ -129,6 +157,42 @@ class Protocol(unittest.TestCase):
         r=self.act(expect_text='Never appears',wait_seconds=0)
         self.assertTrue(r['ok']);self.assertTrue(r['action_executed'])
         self.assertFalse(r['verification']['verified'])
+        self.assertEqual(r['verification']['status'], 'not_observed')
+
+    def test_window_replacement_cannot_verify_a_previous_action(self):
+        snapshot = self.s.snapshot
+
+        def replacement(*args, **kwargs):
+            self.b.generation += 1
+            return snapshot(*args, **kwargs)
+
+        self.s.snapshot = replacement
+        result = self.act(expect_text='Saved', wait_seconds=0)
+        self.assertTrue(result['action_executed'])
+        self.assertEqual(result['verification']['status'], 'unavailable')
+        self.assertIn('observation_error', result)
+        self.assertNotIn('snapshot', result)
+        self.assertIsNone(self.s.current)
+
+    def test_explicit_goal_cannot_be_verified_by_an_automatic_value_check(self):
+        with patch.object(self.s, 'wait', side_effect=RuntimeError('observation failed')):
+            result = self.act('Input', action='set_value', value='hello', expect_text='Confirmation')
+        self.assertEqual(self.b.nodes['edit']['value'], 'hello')
+        self.assertEqual(result['verification']['status'], 'unavailable')
+        self.assertFalse(result['verification']['verified'])
+
+    def test_missing_toggle_state_is_unavailable(self):
+        original = self.b.act
+
+        def act(*args):
+            original(*args)
+            del self.b.nodes['check']['toggle_state']
+
+        self.b.act = act
+        result = self.act('Flag', action='toggle')
+        self.assertTrue(result['action_executed'])
+        self.assertFalse(result['verification']['verified'])
+        self.assertEqual(result['verification']['status'], 'unavailable')
 
     def test_provider_failure_invalidates_refs_and_reports_unknown(self):
         self.b.error_action=True
@@ -171,6 +235,32 @@ class Protocol(unittest.TestCase):
         with self.assertRaises(W.UIError) as e:self.s.snapshot('Test')
         self.assertEqual(e.exception.code,'ambiguous_window')
 
+    def test_desktop_wait_can_start_before_the_window_exists(self):
+        windows = self.b.windows()
+        with patch.object(self.b, 'windows', side_effect=[[], windows]) as find_windows:
+            result = self.s.wait(window='Test', wait_for_window=True, timeout_seconds=1)
+        self.assertEqual(find_windows.call_count, 2)
+        self.assertTrue(result['condition_met'])
+        self.assertEqual(result['snapshot']['window'], 'hwnd:42')
+        with patch.object(self.b, 'windows', return_value=[]):
+            missing = self.s.wait(window='Test', wait_for_window=True, timeout_seconds=0)
+        self.assertEqual(missing['error_code'], 'ui_condition_timeout')
+        self.assertIsNone(missing['snapshot'])
+        self.assertIsNone(self.s.current)
+
+    def test_wait_refuses_a_replacement_window_while_capturing(self):
+        snapshot = self.s.snapshot
+
+        def replacement(*args, **kwargs):
+            self.b.generation += 1
+            return snapshot(*args, **kwargs)
+
+        with patch.object(self.s, 'snapshot', side_effect=replacement):
+            with self.assertRaises(W.UIError) as error:
+                self.s.wait(text='Apply', timeout_seconds=0)
+        self.assertEqual(error.exception.code, 'stale_window')
+        self.assertIsNone(self.s.current)
+
     def test_wait_present_and_absent_with_incomplete_tree(self):
         self.assertTrue(self.s.wait(text='Input',timeout_seconds=0)['condition_met'])
         self.assertTrue(self.s.wait(text='missing',present=False,timeout_seconds=0)['condition_met'])
@@ -185,6 +275,30 @@ class Protocol(unittest.TestCase):
     def test_unknown_operation_and_invalid_ref(self):
         with self.assertRaises(W.UIError):self.s.dispatch('exec',{})
         with self.assertRaises(W.UIError):self.s.action(self.snap['snapshot_id'],'nope')
+
+
+class UIClientIsolation(unittest.TestCase):
+    def test_snapshot_and_diagnostics_are_isolated_per_caller(self):
+        service = W.UIClients(FakeBackend())
+        own = service.dispatch("snapshot", {"_owner": "first"})
+        other = service.dispatch("snapshot", {"_owner": "second"})
+        self.assertNotEqual(own["snapshot_id"], other["snapshot_id"])
+        with self.assertRaises(W.UIError) as rejected:
+            service.dispatch("find", {"_owner": "second", "snapshot_id": own["snapshot_id"]})
+        self.assertEqual(rejected.exception.code, "stale_snapshot")
+        self.assertTrue(service.dispatch("find", {"_owner": "first", "snapshot_id": own["snapshot_id"]})["ok"])
+        diag = service.dispatch("diagnose", {"_owner": "first"})
+        self.assertIsNone(diag["last_error"])
+
+    def test_least_recent_caller_is_evicted_from_bounded_cache(self):
+        service = W.UIClients(FakeBackend(), limit=2)
+        first = service.dispatch("snapshot", {"_owner": "first"})
+        second = service.dispatch("snapshot", {"_owner": "second"})
+        service.dispatch("find", {"_owner": "first", "snapshot_id": first["snapshot_id"]})
+        service.dispatch("snapshot", {"_owner": "third"})
+        with self.assertRaises(W.UIError) as rejected:
+            service.dispatch("find", {"_owner": "second", "snapshot_id": second["snapshot_id"]})
+        self.assertEqual(rejected.exception.code, "stale_snapshot")
 
 
 class IsolatedWorker(unittest.TestCase):
@@ -241,8 +355,10 @@ class ToolRegistration(unittest.TestCase):
 
     def test_observation_and_input_flags(self):
         _, names=self.load(input_enabled=False)
-        self.assertTrue({'ui_snapshot','ui_find','ui_wait'}<=names)
+        self.assertTrue({'ui_snapshot','ui_find','ui_wait','ui_operation'}<=names)
         self.assertNotIn('ui_action',names)
+        self.assertNotIn('ui_action_once',names)
+        self.assertNotIn('ui_run_steps_once',names)
         _, names=self.load(screen=False,input_enabled=False)
         self.assertNotIn('ui_snapshot',names)
 
@@ -252,10 +368,54 @@ class ToolRegistration(unittest.TestCase):
         self.assertIn('ui_action',names)
         m.RO_FLAG.touch()
         r=anyio.run(__import__('functools').partial(m.mcp.call_tool,'ui_action',{'snapshot_id':'bad','ref':'e1'}))
-        self.assertTrue(r.isError);self.assertIsNone(m._UI.proc)
+        self.assertTrue(r.is_error);self.assertIsNone(m._UI.proc)
+        self.assertIn('ui_action_once', names)
+        result = anyio.run(__import__('functools').partial(m.mcp.call_tool, 'ui_action_once', {
+            'snapshot_id': 'bad', 'ref': 'e1', 'operation_id': 'paused-tool-registry-01',
+        }))
+        self.assertTrue(result.is_error)
+        self.assertIsNone(m._UI.proc)
         m.PAUSE_FLAG.touch()
         r=anyio.run(__import__('functools').partial(m.mcp.call_tool,'ui_snapshot',{}))
-        self.assertTrue(r.isError);self.assertIsNone(m._UI.proc)
+        self.assertTrue(r.is_error);self.assertIsNone(m._UI.proc)
+
+
+    def test_mcp_receipt_replays_only_status_and_masks_expectation_in_console(self):
+        import anyio
+
+        # The loader lists tools synchronously, so create the server before entering anyio.
+        m, _ = self.load()
+
+        async def checked_server():
+            arguments = {"snapshot_id": "s", "ref": "e1", "operation_id": "registered-action-01",
+                         "value": "private input", "expect_text": "private expectation"}
+            synthetic = {"ok": True, "action_executed": True, "verification": {"status": "verified"},
+                         "snapshot": {"sensitive": "private window"}}
+            with patch.object(m._UI, "call", return_value=synthetic) as worker:
+                live = await m.mcp.call_tool("ui_action_once", arguments)
+                again = await m.mcp.call_tool("ui_action_once", arguments)
+                got = await m.mcp.call_tool("ui_operation", {"operation_id": arguments["operation_id"]})
+            self.assertFalse(live.is_error)
+            self.assertTrue(again.structured_content["replayed"])
+            self.assertNotIn("snapshot", again.structured_content)
+            self.assertEqual(got.structured_content["operation"]["outcome"], "verified")
+            worker.assert_called_once()
+            summaries = m._args_text(arguments)
+            self.assertNotIn("private", summaries)
+            self.assertIn("expect_text=<19 chars>", summaries)
+            workflow = {"window": "fixture", "steps": [{"type": "assert", "text": "Ready"}],
+                        "operation_id": "registered-workflow-01"}
+            observed = {"ok": True, "completed_steps": 1, "steps": [{"executed": False}]}
+            with patch.object(m._UI, "call", return_value=observed) as worker:
+                finished = await m.mcp.call_tool("ui_run_steps_once", workflow)
+                repeat = await m.mcp.call_tool("ui_run_steps_once", workflow)
+            self.assertFalse(finished.is_error)
+            self.assertTrue(repeat.structured_content["replayed"])
+            self.assertEqual(repeat.structured_content["operation"]["completed_steps"], 1)
+            self.assertNotIn("steps", repeat.structured_content)
+            worker.assert_called_once()
+
+        anyio.run(checked_server)
 
 
 @unittest.skipUnless(os.name=='nt' and os.environ.get('PCBRIDGE_UI_TESTS')=='1', 'opt-in native Windows UI test')

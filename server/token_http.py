@@ -1,4 +1,4 @@
-"""Local, URL-token-compatible Streamable HTTP adapter for PC Bridge 1.7.0.
+"""Local, URL-token-compatible Streamable HTTP adapter for PC Bridge.
 
 For MCP clients that expose only a URL, use:
     http://127.0.0.1:8770/<TOKEN.txt contents>/mcp
@@ -20,17 +20,19 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 from starlette.background import BackgroundTask
 
+from mcp_protocol import MCP_REQUEST_LIMIT
+
 ROOT = Path(__file__).resolve().parent.parent
 PROXY_HOST = "127.0.0.1"
 PROXY_PORT = int(os.environ.get("PCBRIDGE_TOKEN_HTTP_PORT", "8770"))
-MAX_REQUEST_BYTES = 32 * 1024 * 1024
+MAX_REQUEST_BYTES = MCP_REQUEST_LIMIT
 
 # No credentials in access logs, errors, query strings or response bodies.
 logging.getLogger("uvicorn.access").disabled = True
 HOP_HEADERS = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailer", "transfer-encoding", "upgrade", "host",
-    "content-length", "authorization", "cookie", "forwarded",
+    "content-length", "authorization", "cookie", "forwarded", "origin",
     "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto",
 })
 RETURN_HEADERS = frozenset({

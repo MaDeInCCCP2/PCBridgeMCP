@@ -107,12 +107,61 @@ class Snapshots(unittest.TestCase):
         with self.assertRaises(B.BrowserError):self.service.dispatch('evaluate',{'code':'secret'})
 
 
+class BrowserSessionCleanup(unittest.TestCase):
+    def test_context_creation_failure_releases_idle_shared_browser(self):
+        from unittest.mock import Mock
+
+        driver = Mock()
+        chromium = driver.chromium.launch.return_value
+        chromium.new_context.side_effect = RuntimeError("failed to create context")
+        sessions = B.BrowserContexts(factory=lambda: driver)
+
+        with self.assertRaises(B.BrowserError) as err:
+            sessions.dispatch("session_open", {"headless": True})
+        self.assertEqual(err.exception.code, "browser_start_failed")
+        chromium.close.assert_called_once()
+        self.assertEqual(sessions.browsers, {})
+        self.assertEqual(sessions.dispatch("session_inventory", {})["sessions"], [])
+
+    def test_page_creation_failure_releases_context_without_closing_other_owner(self):
+        from unittest.mock import Mock
+
+        driver = Mock()
+        chromium = driver.chromium.launch.return_value
+        first, second = Mock(), Mock()
+        first.new_page.side_effect = RuntimeError("failed to create page")
+        chromium.new_context.return_value = first
+        sessions = B.BrowserContexts(factory=lambda: driver)
+
+        # An existing owner already has a live context in the shared browser.
+        retained = B.BrowserService(shared_browser=sessions.browser)
+        retained.browser = sessions.browser(True)
+        retained.context = second
+        retained.headless = True
+        sessions.sessions[("other-owner", "existing")] = retained
+
+        with self.assertRaises(B.BrowserError) as err:
+            sessions.dispatch("session_open", {"headless": True, "_owner": "new-owner"})
+        self.assertEqual(err.exception.code, "browser_page_start_failed")
+        self.assertEqual(err.exception.details["_live_sessions"], [("other-owner", "existing")])
+        first.close.assert_called_once()
+        second.close.assert_not_called()
+        chromium.close.assert_not_called()
+
+        sessions.dispatch("session_close", {"_owner": "other-owner", "session_id": "existing"})
+        second.close.assert_called_once()
+        chromium.close.assert_called_once()
+        self.assertEqual(sessions.browsers, {})
+
+
 class BrowserRegistration(unittest.TestCase):
     def load(self,browser=True,input_enabled=True,internet=True):
         tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup);root=Path(tmp.name)
         (root/'config.json').write_text(json.dumps({'workspace':str(root/'ws'),'secret':'z'*64,'enable_browser':browser,
             'enable_internet':internet,'enable_input':input_enabled}),encoding='utf-8')
         import sys,types,contextlib
+        from mcp.server.request_state import RequestStateSecurity
+        RequestStateSecurity.ephemeral()
         input_stub=patch.dict(sys.modules,{'pyautogui':types.SimpleNamespace()}) if os.name!='nt' else contextlib.nullcontext()
         with patch.dict(os.environ,{'PCBRIDGE_ROOT':str(root)}),input_stub:m=module('server')
         def cleanup():
@@ -127,15 +176,41 @@ class BrowserRegistration(unittest.TestCase):
         _,names=self.load(internet=False);self.assertNotIn('browser_open',names)
         _,names=self.load(input_enabled=False)
         self.assertIn('browser_snapshot',names);self.assertNotIn('browser_action',names)
+        self.assertIn('browser_operation', names)
+        self.assertNotIn('browser_action_once', names)
+
+    def test_unified_session_inventory_uses_existing_workers_only(self):
+        import anyio
+
+        m, names = self.load()
+        self.assertIn("computer_sessions", names)
+        self.assertEqual(anyio.run(m.computer_sessions), {"sessions": [], "backends": {"browser": "ok"}})
+        self.assertIsNone(m._BROWSER.proc)
+        first = [{"session_id": "browser-one", "mode": "browser"}]
+        second = [{"session_id": "desktop-one", "mode": "win32_desktop"}]
+
+        from unittest.mock import Mock
+        m._DESKTOPS = Mock()
+        m._DESKTOPS.list.return_value = {"sessions": second}
+        token = m._principal.set("client-a")
+        try:
+            with patch.object(m._BROWSER_REQUESTS, "call", return_value={"sessions": first}) as inventory:
+                result = anyio.run(m.computer_sessions)
+            inventory.assert_called_once_with("client-a", "sessions", start=False)
+            m._DESKTOPS.list.assert_called_once_with("client-a")
+        finally:
+            m._principal.reset(token)
+        self.assertEqual(result["sessions"], first + second)
 
     def test_readonly_refuses_browser_writes_before_launching(self):
         import anyio,functools
         m,names=self.load();m.RO_FLAG.touch()
         self.assertIn('browser_action',names)
         for name,args in [('browser_open',{}),('browser_navigate',{'page_id':'bad','url':'https://example.com'}),
-                          ('browser_action',{'page_id':'bad','snapshot_id':'bad','ref':'e1'}),('browser_trace',{})]:
+                          ('browser_action',{'page_id':'bad','snapshot_id':'bad','ref':'e1'}),('browser_trace',{}),
+                          ('browser_action_once', {'session_id':'s','page_id':'p','snapshot_id':'t','ref':'e1','operation_id':'op'})]:
             r=anyio.run(functools.partial(m.mcp.call_tool,name,args))
-            self.assertTrue(r.isError,name);self.assertIsNone(m._BROWSER.proc)
+            self.assertTrue(r.is_error,name);self.assertIsNone(m._BROWSER.proc)
 
 
 HTML='''<!doctype html><title>PCBridge browser fixture</title>
@@ -143,6 +218,8 @@ HTML='''<!doctype html><title>PCBridge browser fixture</title>
 <label>Password <input aria-label="Password" type="password" value="BROWSER_TEST_SECRET"></label>
 <button onclick="document.getElementById('status').textContent='Saved: '+document.getElementById('name').value">Save</button>
 <p style="display:none">Ready</p><p id="status">Ready</p>
+<button onclick="document.getElementById('counter').textContent='Count is '+(++window.clickCount)">Increment</button>
+<p id="counter">Count is 0</p><script>window.clickCount=0</script>
 <button onclick="console.error('fixture console error');fetch('/missing')">Diagnostics</button>
 <a href="/download" download="fixture.txt">Download fixture</a>
 <a href="/next" target="_blank">New tab</a>
@@ -158,6 +235,15 @@ class NativeBrowser(unittest.TestCase):
                 if self.path=='/download':
                     self.send_response(200);self.send_header('Content-Type','application/octet-stream')
                     self.send_header('Content-Disposition','attachment; filename="fixture.txt"');self.end_headers();self.wfile.write(b'bridge-download');return
+                if self.path in ("/storage", "/storage-set"):
+                    body = b'<p id="state"></p><script>document.querySelector("#state").textContent=document.cookie || "empty session"</script>'
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    if self.path == "/storage-set":
+                        self.send_header("Set-Cookie", "pcbridge-fixture=private; Path=/")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 if self.path=='/frame':body=b'<label>Frame value <input aria-label="Frame value"></label>'
                 elif self.path=='/next':body=b'<title>Next fixture</title><h1>Next page</h1>'
                 elif self.path=='/missing':self.send_response(404);self.end_headers();self.wfile.write(b'missing');return
@@ -209,6 +295,37 @@ class NativeBrowser(unittest.TestCase):
         r=self.act('Frame value','textbox','fill','Inside frame')
         self.assertTrue(r['verification']['verified'],r)
 
+    def test_explicit_session_action_receipt_prevents_second_chromium_click(self):
+        from browser_requests import BrowserRequests
+        from operation_receipts import OperationReceiptStore
+
+        path = Path(self.tmp.name) / "browser-receipts.sqlite3"
+        store = OperationReceiptStore(path, b"browser-fixture-key", "browser", scope_limit=512)
+        requests = BrowserRequests(self.client, receipt_store=store)
+        snapshot = requests.call("receipt-test", "session_open", {"url": self.url, "headless": True})
+        sid, page_id = snapshot["session_id"], snapshot["page_id"]
+        try:
+            match = requests.call("receipt-test", "find", {"page_id": page_id, "snapshot_id": snapshot["snapshot_id"],
+                                                          "text": "Increment", "role": "button"})["matches"][0]
+            arguments = {"page_id": page_id, "snapshot_id": snapshot["snapshot_id"], "ref": match["ref"],
+                         "expect_text": "Count is 1"}
+            first = requests.act_once("receipt-test", sid, "increment", arguments)
+            self.assertEqual(first["operation"]["outcome"], "verified", first)
+            self.assertTrue(requests.act_once("receipt-test", sid, "increment", arguments)["replayed"])
+            after = requests.call("receipt-test", "snapshot", {"page_id": page_id})
+            self.assertIn("Count is 1", after["aria"])
+            self.assertNotIn("Count is 2", after["aria"])
+        finally:
+            requests.call("receipt-test", "session_close", {"session_id": sid})
+        client = C.ComputerUseClient(APP / "server" / "browser_worker.py", Path(self.tmp.name) / "receipt.log",
+                                     close_at_exit=False)
+        restarted = BrowserRequests(client, receipt_store=OperationReceiptStore(
+            path, b"browser-fixture-key", "browser", scope_limit=512))
+        replay = restarted.act_once("receipt-test", sid, "increment", arguments)
+        self.assertEqual(replay["operation"], first["operation"])
+        self.assertTrue(replay["replayed"])
+        self.assertIsNone(client.proc)
+
     def test_console_network_download_and_trace(self):
         self.client.call('trace',{'action':'start'})
         self.act('Diagnostics','button')
@@ -228,6 +345,37 @@ class NativeBrowser(unittest.TestCase):
         trace=Path(self.tmp.name)/'trace.zip'
         self.client.call('trace',{'action':'stop','path':str(trace)})
         self.assertTrue(trace.is_file());self.assertGreater(trace.stat().st_size,0)
+
+    def test_session_storage_and_page_handles_are_isolated(self):
+        first = self.client.call("navigate", {"page_id": self.page_id, "url": self.url + "/storage-set"})
+        self.assertIn("pcbridge-fixture=private", first["aria"])
+        other = self.client.call("session_open", {"url": self.url + "/storage", "headless": True})
+        try:
+            self.assertIn("empty session", other["aria"])
+            self.assertNotIn("pcbridge-fixture", other["aria"])
+            self.assertEqual(other["desktop_interference"], "no_physical_input")
+            self.assertEqual(self.client.call("sessions", {"_owner": "second"})["sessions"], [])
+            with self.assertRaises(C.ComputerUseError):
+                self.client.call("snapshot", {"page_id": other["page_id"], "_owner": "second"})
+            with self.assertRaises(C.ComputerUseError):
+                self.client.call("session_close", {"session_id": other["session_id"], "_owner": "second"})
+        finally:
+            self.client.call("session_close", {"session_id": other["session_id"]})
+        self.assertIn(self.page_id, {p["page_id"] for p in self.client.call("tabs")["pages"]})
+
+    def test_inventory_and_close_preserve_the_other_owner(self):
+        other = self.client.call("session_open", {"headless": True, "_owner": "second", "url": self.url})
+        try:
+            sessions = self.client.call("session_inventory", {})["sessions"]
+            self.assertEqual({item["owner"] for item in sessions}, {"owner", "second"})
+            entry = next(item for item in sessions if item["owner"] == "second")
+            self.assertEqual((entry["pages"], entry["snapshots"]), (1, 1))
+            self.assertNotIn("url", entry)
+            self.assertNotIn("snapshot_id", entry)
+        finally:
+            self.client.call("session_close", {"session_id": other["session_id"], "_owner": "second"})
+        self.assertEqual(self.client.call("sessions", {"_owner": "second"})["sessions"], [])
+        self.assertIn(self.page_id, {p["page_id"] for p in self.client.call("tabs")["pages"]})
 
     def test_tabs_navigation_wait_and_close(self):
         self.act('New tab','link')

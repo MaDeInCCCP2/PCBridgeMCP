@@ -9,6 +9,9 @@ import time
 import uuid
 
 
+UIA_ACTIONS = frozenset({'invoke', 'set_value', 'toggle', 'select', 'expand', 'collapse', 'scroll'})
+
+
 class UIError(ValueError):
     def __init__(self, code, message, **details):
         super().__init__(message)
@@ -247,31 +250,53 @@ class UIService:
                 'snapshot_truncated': cur['result']['truncated'],
                 'hint': 'Search covers the captured snapshot only; increase snapshot depth/nodes if needed.'}
 
-    def wait(self, window='', text='', role='', present=True, timeout_seconds=10, max_nodes=200):
-        if not text and not role:
+    def wait(self, window='', text='', role='', present=True, timeout_seconds=10, max_nodes=200,
+             max_depth=8, *, wait_for_window=False):
+        has_selector = bool(text or role)
+        if not has_selector and (not wait_for_window or not present):
             raise UIError('invalid_condition', 'Specify text or role to wait for')
         timeout_seconds = max(0, min(float(timeout_seconds), 30))
-        hwnd = self._choose(window)
-        identity = self.backend.identity(self.backend.root(hwnd))
         deadline = self.clock() + timeout_seconds
+        if wait_for_window:
+            self.current = None
+        while True:
+            try:
+                hwnd = self._choose(window)
+                break
+            except UIError as error:
+                if not wait_for_window or error.code != 'window_not_found':
+                    raise
+                remaining = deadline - self.clock()
+                if remaining <= 0:
+                    return {'ok': False, 'error': 'The window did not appear before timeout',
+                            'error_code': 'ui_condition_timeout', 'condition_met': False, 'snapshot': None}
+                time.sleep(min(.15, remaining))
+
+        identity = self.backend.identity(self.backend.root(hwnd))
         while True:
             if self.backend.identity(self.backend.root(hwnd)) != identity:
+                self.current = None
                 raise UIError('stale_window', 'Window identity changed while waiting')
-            snapshot = self.snapshot('hwnd:' + str(hwnd), max_nodes=max_nodes)
+            snapshot = self.snapshot('hwnd:' + str(hwnd), max_nodes=max_nodes, max_depth=max_depth)
+            if self.current['root_identity'] != identity:
+                self.current = None
+                raise UIError('stale_window', 'Window identity changed while waiting')
+            if not has_selector:
+                return {'ok': True, 'condition_met': True, 'matches': [], 'snapshot': snapshot}
             hits = [n for n in snapshot['elements'] if n['visible'] and self.matches(n, text, role)]
             if bool(hits) == bool(present):
                 # An incomplete tree cannot prove an element is absent.
                 if present or not snapshot['truncated'] and not snapshot['unreadable_nodes']:
                     return {'ok': True, 'condition_met': True, 'matches': hits[:30], 'snapshot': snapshot}
-            if self.clock() >= deadline:
+            remaining = deadline - self.clock()
+            if remaining <= 0:
                 return {'ok': False, 'error': 'UI condition was not observed before timeout',
                         'error_code': 'ui_condition_timeout', 'condition_met': False, 'snapshot': snapshot}
-            time.sleep(.15)
+            time.sleep(min(.15, remaining))
 
     def action(self, snapshot_id, ref, action='invoke', value='', expect_text='', wait_seconds=2):
-        supported = {'invoke', 'set_value', 'toggle', 'select', 'expand', 'collapse', 'scroll'}
-        if action not in supported:
-            raise UIError('unsupported_action', 'Supported actions: ' + ', '.join(sorted(supported)))
+        if action not in UIA_ACTIONS:
+            raise UIError('unsupported_action', 'Supported actions: ' + ', '.join(sorted(UIA_ACTIONS)))
         if not isinstance(value, str) or len(value) > 100000:
             raise UIError('invalid_value', 'value must be a string no longer than 100000 characters')
         if action == 'scroll' and value not in ('up', 'down'):
@@ -306,31 +331,34 @@ class UIService:
         except Exception as e:
             raise UIError('ui_action_failed', 'UI provider failed during the action. Observe before retrying.',
                           outcome='unknown', retry_action=False) from e
-        verification = {'verified': False, 'reason': 'No goal condition was supplied'}
-        try:
-            after_node = self.backend.inspect(element)
-            if action == 'set_value' and not node.get('password'):
-                verified=getattr(self.backend,'value_equals',lambda _element,expected:after_node.get('value')==expected)(element,value)
-                verification = {'verified': verified is True, 'reason': 'value comparison'}
-            elif action == 'toggle':
-                verification = {'verified': after_node.get('toggle_state') != node.get('toggle_state'), 'reason': 'toggle state comparison'}
-            elif action in ('expand', 'collapse'):
-                verification = {'verified': after_node.get('expand_state') == (1 if action == 'expand' else 0), 'reason': 'expand/collapse state'}
-            elif action == 'select':
-                verification = {'verified': after_node.get('selected') is True, 'reason': 'selection state'}
-        except Exception:
-            pass
+        checks = {'toggle': 'toggle state comparison', 'select': 'selection state',
+                  'expand': 'expand/collapse state', 'collapse': 'expand/collapse state'}
+        if not node.get('password'):
+            checks['set_value'] = 'value comparison'
+        reason = 'expected text visible' if expect_text else checks.get(action)
+        verification = {'verified': False, 'status': 'unavailable' if reason else 'not_requested',
+                        'reason': reason or 'No goal condition was supplied'}
         try:
             if self.backend.identity(self.backend.root(cur['hwnd'])) != cur['root_identity']:
                 raise UIError('stale_window', 'Target window changed after the action')
             if expect_text:
                 observed = self.wait('hwnd:' + str(cur['hwnd']), text=expect_text,
                                      timeout_seconds=min(10, max(0, float(wait_seconds))),
-                                     max_nodes=cur['options']['max_nodes'])
+                                     max_nodes=cur['options']['max_nodes'],
+                                     max_depth=cur['options']['max_depth'])
                 after = observed['snapshot']
-                verification = {'verified': observed['condition_met'], 'reason': 'expected text visible'}
             else:
+                if reason:
+                    self._verify_semantic_action(verification, element, node, action, value)
                 after = self.snapshot('hwnd:' + str(cur['hwnd']), **cur['options'])
+            if self.current['root_identity'] != cur['root_identity']:
+                self.current = None
+                if reason:
+                    verification.update(verified=False, status='unavailable')
+                raise UIError('stale_window', 'Target window changed during verification')
+            if expect_text:
+                verified = observed['condition_met']
+                verification.update(verified=verified, status='verified' if verified else 'not_observed')
         except Exception as e:
             return {'ok': True, 'action_executed': True, 'action': action,
                     'verification': verification, 'observation_error': str(e),
@@ -338,6 +366,23 @@ class UIService:
         return {'ok': True, 'action_executed': True, 'action': action, 'verification': verification,
                 'ui_changed': before != after['elements'], 'snapshot': after,
                 'hint': 'Use the NEW snapshot_id/refs for the next action; action execution alone does not prove the goal.'}
+
+    def _verify_semantic_action(self, verification, element, before, action, value):
+        try:
+            after = self.backend.inspect(element)
+            if action == 'set_value':
+                compare = getattr(self.backend, 'value_equals', None)
+                verified = compare(element, value) if compare else after['value'] == value
+            elif action == 'toggle':
+                verified = after['toggle_state'] != before['toggle_state']
+            elif action == 'select':
+                verified = after['selected'] is True
+            else:
+                verified = after['expand_state'] == (1 if action == 'expand' else 0)
+        except Exception:
+            return  # Leave the verification unavailable when the provider cannot read the target.
+        if verified is not None:
+            verification.update(verified=verified, status='verified' if verified else 'not_observed')
 
     def find_live(self, window='', text='', role='', automation_id='', exact=False,
                   limit=30, max_scan=3000, max_depth=30):
@@ -537,9 +582,29 @@ class UIService:
             raise
 
 
-def main():
+class UIClients:
+    """One COM backend, with a bounded independent snapshot and event history per caller."""
+    def __init__(self, backend, limit=16):
+        self.backend = backend
+        self.limit = limit
+        self.clients = collections.OrderedDict()
+
+    def dispatch(self, operation, arguments):
+        arguments = dict(arguments)
+        owner = arguments.pop("_owner", "owner")
+        service = self.clients.pop(owner, None)
+        if service is None:
+            service = UIService(self.backend)
+        self.clients[owner] = service
+        if len(self.clients) > self.limit:
+            self.clients.popitem(last=False)
+        return service.dispatch(operation, arguments)
+
+
+def serve(factory, replies=None):
     # stdout is protocol-only; warnings and diagnostics go to stderr.
-    sys.stdout.reconfigure(encoding='utf-8')
+    replies = replies if replies is not None else sys.stdout
+    replies.reconfigure(encoding='utf-8')
     sys.stdin.reconfigure(encoding='utf-8')
     service = None
     for line in sys.stdin:
@@ -554,14 +619,14 @@ def main():
             if not isinstance(request.get('arguments', {}), dict):
                 raise UIError('invalid_request', 'UI arguments must be an object')
             if service is None:
-                service = UIService(WindowsBackend())
+                service = factory()
             result = service.dispatch(request['operation'], request.get('arguments') or {})
             response = {'id': request['id'], 'ok': True, 'result': result}
         except Exception as e:
             response = {'id': request.get('id'), 'ok': False, 'error_code': getattr(e, 'code', 'ui_failed'),
                         'error': str(e), 'details': getattr(e, 'details', {})}
-        print(json.dumps(response, ensure_ascii=False), flush=True)
+        print(json.dumps(response, ensure_ascii=False), file=replies, flush=True)
 
 
 if __name__ == '__main__':
-    main()
+    serve(lambda: UIClients(WindowsBackend()))

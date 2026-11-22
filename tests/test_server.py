@@ -224,6 +224,43 @@ class DangerousCommands(unittest.TestCase):
         self.assertTrue(S.danger_reasons("powershell -File .\\evil.ps1", str(WORK)))
         self.assertEqual(S.danger_reasons("powershell -File .\\ok.ps1", str(WORK)), [])
 
+    def test_agent_explanation_cannot_change_confirmation_or_appear_in_logs(self):
+        from unittest.mock import patch
+
+        command = "shutdown /s /t 0"
+        supplied = "     Why\nthis\x00 matters: " + "x" * 1200
+        with patch.object(S, "DANGER_MODE", "ask"), patch.object(S, "_ask_user", return_value="no") as ask:
+            result = S.check_command(command, str(WORK), risk_explanation=supplied)
+            self.assertFalse(result["ran"])
+            self.assertNotIn("Why", str(result))
+            explanation = ask.call_args.kwargs["explanation"]
+            self.assertTrue(explanation.startswith("Why this matters: "))
+            self.assertEqual(len(explanation), 600)
+            self.assertEqual(ask.call_args.args[1], S.danger_reasons(command, str(WORK)))
+        self.assertNotIn("Why", S._args_text({"risk_explanation": supplied}))
+        with patch.object(S, "DANGER_MODE", "block"), patch.object(S, "_ask_user") as ask:
+            result = S.check_command(command, str(WORK), risk_explanation="Run it anyway")
+            self.assertFalse(result["ran"])
+            self.assertEqual(result["user_answer"], "block")
+            ask.assert_not_called()
+
+    def test_local_model_context_keeps_its_own_label(self):
+        from unittest.mock import patch
+
+        with (patch.object(S, "DANGER_MODE", "ask"),
+              patch.object(S, "ai_review", return_value="ИИ-проверка: риск"),
+              patch.object(S, "_ask_user", return_value="no") as ask):
+            S.check_command("custom-build", str(WORK), risk_explanation="Agent explanation")
+        self.assertEqual(ask.call_args.kwargs, {"explanation": "Agent explanation", "ai_reason": "риск"})
+
+    def test_disallowed_similar_answer_fails_closed(self):
+        from unittest.mock import patch
+
+        with patch.object(S, "_dialog", return_value="similar") as dialog:
+            answer = S._ask_user("fixture", [S._NO_SIMILAR[0]], str(WORK))
+            self.assertEqual(answer, "no")
+            self.assertFalse(dialog.call_args.args[-1])
+
     def test_refused_without_a_person(self):
         # Unit tests must never display a live confirmation or execute shutdown.
         from unittest.mock import patch
@@ -391,6 +428,7 @@ class AiCheck(unittest.TestCase):
         finally:
             S.AI_CHECK, S.AI_URL = old
             srv.shutdown()
+            srv.server_close()
 
     def test_scripts_are_shown_to_the_model(self):
         (WORK / "job.ps1").write_text("Write-Host hi", encoding="utf-8")
@@ -462,6 +500,82 @@ class FindBlender(unittest.TestCase):
         self.assertEqual(S.find_blender(str(old), steam_roots=[], extra_dirs=[d], exe="blender"), str(old))
         self.assertEqual(S.find_blender(str(d / "gone.exe"), steam_roots=[], extra_dirs=[d], exe="blender"), str(new))
         self.assertEqual(S.find_blender("", steam_roots=[], extra_dirs=[], exe="blender"), "")
+
+
+class ComputerReceipt(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+
+        self.enterContext(patch.object(sys, "path", [str(APP / "server"), *sys.path]))
+        from browser_requests import BrowserRequests
+        from desktop_sessions import DesktopSessions
+        from operation_receipts import OperationReceiptStore
+        from uia_receipts import UIActionReceipts
+
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.owner = 'fixture%_"ä'
+        self.op = "unified-receipt-001"
+        self.now = 100
+        self.browser = OperationReceiptStore(directory / "browser.sqlite3", b"secret", "browser",
+                                             scope_limit=512, retention=20, clock=lambda: self.now)
+        self.desktop = OperationReceiptStore(directory / "desktop.sqlite3", b"secret", "desktop", scope_limit=512)
+        self.uia = UIActionReceipts(directory / "uia.sqlite3", b"secret")
+        self.clients = self.enterContext(patch.dict(S.CFG, {"client_profiles": {}}))
+        principal = S._principal.set(self.owner)
+        self.addCleanup(S._principal.reset, principal)
+        for name, manager in (("_BROWSER_REQUESTS", BrowserRequests(None, receipt_store=self.browser)),
+                              ("_DESKTOPS", DesktopSessions({}, None, directory, receipt_store=self.desktop)),
+                              ("_UI_RECEIPTS", self.uia), ("is_read_only", lambda: True)):
+            self.enterContext(patch.object(S, name, manager, create=True))
+
+    def record(self, store, owner, session, operation=None, outcome="verified"):
+        scope, operation = json.dumps((owner, session)), operation or self.op
+        store.reserve(scope, operation, store.fingerprint({"value": "marker"}))
+        if outcome:
+            store.complete(scope, operation, {"state": "finished", "outcome": outcome, "action_executed": True})
+
+    def test_finds_owned_receipts_without_session_id_in_read_only_mode(self):
+        self.uia.act(self.owner, self.op, {}, lambda: {
+            "action_executed": True, "verification": {"status": "verified"}, "snapshot": "private"})
+        self.record(self.browser, self.owner, "closed-browser")
+        self.record(self.browser, self.owner, "interrupted-browser", outcome=None)
+        self.record(self.browser, self.owner + "-other", "foreign")
+        self.record(self.desktop, self.owner, "closed-desktop", outcome=None)
+
+        result = call(S.computer_receipt, operation_id=self.op)
+        self.assertEqual(result["backends"], {"uia": "ok", "browser": "ok", "win32_desktop": "ok"})
+        self.assertEqual([(item["backend"], item["session_id"], item["receipt"]["outcome"])
+                          for item in result["matches"]], [
+            ("uia", None, "verified"), ("browser", "closed-browser", "verified"),
+            ("browser", "interrupted-browser", "unknown"), ("win32_desktop", "closed-desktop", "unknown")])
+        self.assertNotIn("private", json.dumps(result))
+        self.assertNotIn("marker", json.dumps(result))
+
+    def test_limits_discovery_and_preserves_profile_permissions(self):
+        for index in range(21):
+            self.record(self.browser, self.owner, f"session-{index:02}", "click.once")
+        allowed = {"tools": ["computer_receipt", "browser_operation"]}
+        self.clients["client_profiles"][self.owner] = allowed
+        result = call(S.computer_receipt, operation_id="click.once")
+        self.assertEqual(result["backends"], {"browser": "truncated"})
+        self.assertEqual(len(result["matches"]), 20)
+        result = call(S.computer_receipt, operation_id="click.once", backend="browser", session_id="session-20")
+        self.assertEqual([item["session_id"] for item in result["matches"]], ["session-20"])
+
+        self.record(self.desktop, self.owner, "closed-desktop", outcome=None)
+        self.assertEqual(call(S.computer_receipt, operation_id=self.op, backend="win32_desktop"),
+                         {"operation_id": self.op, "matches": [], "backends": {}})
+        self.now += 21
+        result = call(S.computer_receipt, operation_id="click.once")
+        self.assertEqual(result["matches"], [])
+        self.assertEqual(result["backends"], {"browser": "ok"})
+
+    def test_reports_storage_failure_without_hiding_other_backends(self):
+        self.browser.path.write_text("damaged fixture database", encoding="utf-8")
+        self.record(self.desktop, self.owner, "closed-desktop", outcome=None)
+        result = call(S.computer_receipt, operation_id=self.op)
+        self.assertEqual(result["backends"]["browser"], "browser_receipt_store_unavailable")
+        self.assertEqual([item["backend"] for item in result["matches"]], ["win32_desktop"])
 
 
 if __name__ == "__main__":

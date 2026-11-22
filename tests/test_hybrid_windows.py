@@ -110,7 +110,7 @@ class HybridWindows(unittest.TestCase):
         self.assertEqual(denied.exception.response.status_code, 401)
         version, _, error = self.call("server_info")
         self.assertFalse(error)
-        self.assertEqual(version["version"], "1.7.0")
+        self.assertEqual(version["version"], (Path(__file__).resolve().parents[1] / "VERSION.txt").read_text().strip())
         argv = ['a"b', "Кириллица", "& $env:EXAMPLE", ""]
         source = self.root / "own-output.bin"
         code = ("import pathlib,sys,os,time,json; print('ready',flush=True); time.sleep(2); "

@@ -44,6 +44,8 @@ class Helpers(unittest.TestCase):
         x = P.toast_xml('T&"', "a<b\nline2\nline3", [("Показать", "http://127.0.0.1:1/?k=a&show=1")], "http://x/?a=1&b=2")
         self.assertIn("T&amp;&quot;", x)
         self.assertIn("a&lt;b", x)
+        self.assertIn('<audio silent="true"/>', x)
+        self.assertIn('hint-maxLines="1"', x)
         self.assertNotIn("line3", x)
         self.assertIn('arguments="http://127.0.0.1:1/?k=a&amp;show=1"', x)
         self.assertIn('launch="http://x/?a=1&amp;b=2"', x)
@@ -213,6 +215,91 @@ class PanelHttp(unittest.TestCase):
         self.assertIn("restart_bridge", names)
         self.assertIn("error", json.loads(self.req("POST", "/api/undo", {"ids": []})[1]))
 
+    def test_local_catalogs_require_panel_key(self):
+        for path, data in (("/api/oauth-clients", {"clients": []}), ("/api/extensions", {"skill": [], "plugin": []})):
+            self.assertEqual(self.req("GET", path, key=False)[0], 403)
+            status, body, _ = self.req("GET", path)
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body), data)
+
+    def test_diagnostics_export_requires_key_and_contains_only_projected_events(self):
+        event = {"event": "tool_finished", "tool": "file_info", "ts": 1780000000,
+                 "duration_ms": 7.5, "outcome": "error", "error_code": "fixture_error",
+                 "correlation_id": "1" * 32, "client_id": "personal-id",
+                 "args": {"path": "private-path"}, "traceback": "private-trace"}
+        path = self.p.m.LOGS / "diagnostics.jsonl"
+        path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+        self.addCleanup(path.unlink, missing_ok=True)
+        self.assertEqual(self.req("GET", "/api/diagnostics/export", key=False)[0], 403)
+        self.assertEqual(self.req("GET", "/api/diagnostics/export", host="somewhere.example")[0], 403)
+        status, data, response = self.req("GET", "/api/diagnostics/export")
+        self.assertEqual(status, 200)
+        self.assertIn("attachment", response.getheader("Content-Disposition"))
+        report = json.loads(data)
+        self.assertEqual(report["events"][0]["correlation_id"], event["correlation_id"])
+        self.assertEqual(report["events"][0]["error_code"], "fixture_error")
+        self.assertNotIn("private", data)
+        self.assertNotIn("personal-id", data)
+        self.assertEqual(json.loads(self.req("GET", "/api/diagnostics")[1]), report)
+
+    def test_tool_catalog_is_keyed_and_read_only(self):
+        self.assertEqual(self.req("GET", "/api/mcp-tools", key=False)[0], 403)
+        from unittest.mock import patch
+
+        with patch.object(self.p, "control", return_value={"tools": []}) as control:
+            self.assertEqual(json.loads(self.req("GET", "/api/mcp-tools")[1]), {"tools": []})
+            self.assertEqual(self.req("POST", "/api/mcp-tools", {"name": "apply_file_edits"})[0], 404)
+            control.assert_called_once_with("tool-catalog", {}, timeout=3)
+
+    def test_diagnostic_replay_requires_key_and_object_arguments(self):
+        from unittest.mock import patch
+
+        path = "/api/diagnostic-replay"
+        call = {"name": "computer_plan", "arguments": {"target": "browser"}}
+        with patch.object(self.p, "control", return_value={"result": {"ok": True}}) as control:
+            self.assertEqual(self.req("POST", path, call, key=False)[0], 403)
+            self.assertEqual(self.req("POST", path, call, host="somewhere.example")[0], 403)
+            self.assertEqual(self.req("GET", path)[0], 404)
+            self.assertEqual(self.req("POST", path, {**call, "arguments": []})[0], 400)
+            self.assertEqual(self.req("POST", path, {**call, "arguments": {"target": "a" * 17000}})[0], 413)
+            control.assert_not_called()
+            status, body, response = self.req("POST", path, call)
+            self.assertEqual(status, 200)
+            self.assertEqual(response.getheader("Cache-Control"), "no-store")
+            self.assertEqual(json.loads(body), {"result": {"ok": True}})
+            control.assert_called_once_with("diagnostic-replay", call, timeout=5)
+
+    def test_work_history_and_controls_are_keyed(self):
+        from unittest.mock import patch
+
+        with patch.object(self.p, "control", return_value={"ok": True}) as control:
+            self.assertEqual(self.req("GET", "/api/jobs", key=False)[0], 403)
+            self.assertEqual(self.req("GET", "/api/desktop-sessions", key=False)[0], 403)
+            self.assertEqual(self.req("GET", "/api/desktop-sessions", host="somewhere.example")[0], 403)
+            for route in ("job-stop", "browser-session-close", "desktop-session-input"):
+                self.assertEqual(self.req("POST", "/api/" + route, {}, key=False)[0], 403)
+                self.assertEqual(self.req("POST", "/api/" + route, {}, host="somewhere.example")[0], 403)
+            control.assert_not_called()
+            self.assertEqual(self.req("GET", "/api/jobs")[0], 200)
+            control.assert_called_once_with("jobs", {}, timeout=5)
+            control.reset_mock()
+            job = {"job_id": "a" * 32}
+            self.assertEqual(self.req("POST", "/api/job-stop", job)[0], 200)
+            control.assert_called_once_with("job-stop", job, timeout=35)
+
+    def test_desktop_input_control_validates_id_and_boolean(self):
+        from unittest.mock import patch
+
+        path = "/api/desktop-session-input"
+        request = {"session_id": "a" * 32, "paused": True, "owner": "another-client"}
+        with patch.object(self.p, "control", return_value={"ok": True}) as control:
+            self.assertEqual(self.req("POST", path, {**request, "paused": 1})[0], 400)
+            self.assertEqual(self.req("POST", path, {**request, "session_id": "b" * 31})[0], 400)
+            self.assertEqual(self.req("GET", path)[0], 404)
+            control.assert_not_called()
+            self.assertEqual(self.req("POST", path, request)[0], 200)
+            control.assert_called_once_with("desktop-session-input", {"session_id": "a" * 32, "paused": True}, timeout=5)
+
     def test_undo_without_server(self):
         self.sup.cfg["ctrl_port"] = 1
         r = json.loads(self.req("POST", "/api/undo", {"ids": ["x"]})[1])
@@ -284,8 +371,19 @@ class Tray(unittest.TestCase):
         s.changes_notice([{"id": "a", "snaps": [{"path": "/w/x.py"}, {"path": "/w/y.py"}]},
                           {"id": "b", "snaps": [{"path": "/w/x.py"}]}])
         text, kw = got[0]
-        self.assertTrue(text.startswith("Агент изменил 2 файла\nx.py, y.py"))
-        self.assertEqual(kw["buttons"], [("Показать", "u?show=a,b"), ("Отменить", "u?undo=a,b")])
+        self.assertEqual(kw["title"], "Агент изменил 2 файла")
+        self.assertEqual(text, "x.py, y.py")
+        self.assertEqual(kw["buttons"], [("Посмотреть изменения", "u?show=a,b"),
+                                        ("Проверить отмену", "u?undo=a,b")])
+
+    def test_denied_notification_does_not_echo_old_command_text(self):
+        s = self.sup()
+        got = []
+        s.notify = lambda text, **kw: got.append((text, kw))
+        s.panel = types.SimpleNamespace(url=lambda **p: "u?" + p["tab"])
+        s.event_notice({"kind": "denied", "text": "Отказано в команде: private command"})
+        self.assertEqual(got, [("PC Bridge остановил запуск команды.",
+                               {"title": "Команда не запущена", "buttons": [("Открыть ленту действий", "u?feed")]})])
 
     def test_toast_falls_back(self):
         s = self.sup()

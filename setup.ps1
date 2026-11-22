@@ -83,7 +83,7 @@ function Warn($t) { W "  [!] $t" -ForegroundColor Yellow }
 function Fail($t) {
     W ""
     W "  [ОШИБКА] $t" -ForegroundColor Red
-    W "  Подробности в папке logs. Описание проблем - README.txt, раздел 'Если что-то не работает'." -ForegroundColor Red
+    W "  Подробности в папке logs. Описание проблем - README.md, раздел 'Если что-то не работает'." -ForegroundColor Red
     RH "Нажмите Enter, чтобы закрыть"
     exit 1
 }
@@ -174,10 +174,32 @@ if ($Mode -eq "stop") {
     if ($script:StoppedOld) { W "PC Bridge остановлен." -ForegroundColor Green } else { W "PC Bridge не запущен." }
     exit 0
 }
+# Clean-install smoke for CI. Uses an isolated checkout and no tunnel or tray process.
+if ($Mode -eq "test") {
+    $testPython = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $testPython) { $testPython = Get-Command py -ErrorAction SilentlyContinue }
+    if (-not $testPython) { throw "Python or the Python launcher must be on PATH" }
+    & $testPython.Source -c "import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)"
+    if ($LASTEXITCODE -ne 0) { throw "PCBridge requires Python 3.11 or newer" }
+    & $testPython.Source (Join-Path $ToolsDir "verify_distribution.py") $Root
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & $testPython.Source -m venv (Join-Path $Root ".venv")
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & $VenvPy -m pip install -r (Join-Path $Root "server\requirements.txt")
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & $VenvPy -m pip check
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & $VenvPy (Join-Path $ToolsDir "smoke_mcp.py")
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & $VenvPy -m unittest discover -s tests -v
+    exit $LASTEXITCODE
+}
+
 W ""
 W "  ============================================" -ForegroundColor Cyan
 W "     PC Bridge $Ver - мост между Notion-агентом и ПК" -ForegroundColor Cyan
 W "  ============================================" -ForegroundColor Cyan
+
 
 Stop-Old
 
@@ -440,20 +462,20 @@ function Save-Config { ($cfg | ConvertTo-Json -Depth 5) | Set-Content -Path $Cfg
 Save-Config
 
 # ------------------------------------------------------------- python ------
-Step "Проверяю Python 3.10+"
+Step "Проверяю Python 3.11+"
 function Find-Python {
     foreach ($c in @("py", "python", "python3")) {
         $cmd = Get-Command $c -ErrorAction SilentlyContinue
         if (-not $cmd -or $cmd.Source -like "*WindowsApps*") { continue }
         try {
             $pa = if ($c -eq "py") { @("-3", "-c") } else { @("-c") }
-            $v = & $c @pa "import sys;print(sys.executable);print(sys.version_info>=(3,10))" 2>$null
+            $v = & $c @pa "import sys;print(sys.executable);print(sys.version_info>=(3,11))" 2>$null
             if ($LASTEXITCODE -eq 0 -and $v.Count -ge 2 -and $v[1] -eq "True") { return $v[0] }
         } catch {}
     }
     $cands = Get-ChildItem -Path "$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe", "$env:ProgramFiles\Python3*\python.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending
     foreach ($p in $cands) {
-        try { $ok = & $p.FullName -c "import sys;print(sys.version_info>=(3,10))" 2>$null; if ($ok -eq "True") { return $p.FullName } } catch {}
+        try { $ok = & $p.FullName -c "import sys;print(sys.version_info>=(3,11))" 2>$null; if ($ok -eq "True") { return $p.FullName } } catch {}
     }
     return $null
 }
@@ -482,17 +504,35 @@ if (-not $py) {
 }
 Ok "Python: $py"
 
+& $py (Join-Path $ToolsDir "verify_distribution.py") $Root
+if ($LASTEXITCODE -ne 0) { Fail "PC Bridge distribution is incomplete. Extract the complete release before installing." }
+
 # ------------------------------------------------------------- packages ----
 Step "Проверяю библиотеки Python"
+if (Test-Path -LiteralPath (Join-Path $Root ".venv")) {
+    $supported = $false
+    if (Test-Path -LiteralPath $VenvPy) {
+        try {
+            & $VenvPy -c "import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)" 2>$null
+            $supported = ($LASTEXITCODE -eq 0)
+        } catch {}
+    }
+    if (-not $supported) {
+        $backupName = ".venv-previous-" + [guid]::NewGuid().ToString("N").Substring(0, 8)
+        Rename-Item -LiteralPath (Join-Path $Root ".venv") -NewName $backupName
+        Say "  Старое виртуальное окружение сохранено в $backupName"
+    }
+}
 if (-not (Test-Path $VenvPy)) {
     Say "  Создаю виртуальное окружение .venv ..."
     & $py -m venv (Join-Path $Root ".venv")
     if (-not (Test-Path $VenvPy)) { Fail "Не удалось создать .venv" }
 }
 # keep in sync with server\requirements.txt
-$pkgs = @("mcp>=1.10,<2", "httpx>=0.27,<1", "pillow>=10.4,<13", "send2trash>=1.8,<2", "psutil>=5.9,<8", "pystray>=0.19,<1")
+$pkgs = @("mcp>=2.3,<3", "httpx>=0.27,<1", "httpx2>=2.10,<3", "PyYAML>=6.0.2,<7", "pillow>=10.4,<13", "send2trash>=1.8,<2", "psutil>=5.9,<8", "pystray>=0.19,<1")
 if ($cfg.enable_input) { $pkgs += "pyautogui>=0.9.54,<1" }
-if ($cfg.enable_screen) { $pkgs += "pywinauto>=0.6.8,<0.7"; $pkgs += "comtypes>=1.4.8,<2" }
+if ($cfg.enable_screen -or $cfg.enable_background_desktop) { $pkgs += "pywinauto>=0.6.8,<0.7"; $pkgs += "comtypes>=1.4.8,<2" }
+if ($cfg.enable_background_desktop) { $pkgs += "pywin32>=310" }
 if ($cfg.enable_browser) { $pkgs += "playwright>=1.64,<2" }
 if ($cfg.enable_screen -and $cfg.enable_dxgi_capture) { $pkgs += "windows-capture>=2.0.1,<3" }
 $marker = Join-Path $Root ".venv\pc-bridge-packages.txt"
@@ -511,7 +551,7 @@ if ($cfg.enable_browser) {
     if ($LASTEXITCODE -ne 0) { Fail "Не удалось установить браузер Playwright" }
 }
 
-& $VenvPy -c "import mcp.server.fastmcp, httpx, PIL, uvicorn, send2trash"
+& $VenvPy -c "import mcp.server.mcpserver, httpx, httpx2, PIL, uvicorn, send2trash"
 if ($LASTEXITCODE -ne 0) { Remove-Item $marker -ErrorAction SilentlyContinue; Fail "Библиотеки установлены с ошибкой. Запустите START.bat ещё раз." }
 Ok "Библиотеки на месте"
 
@@ -980,7 +1020,18 @@ Ok "Туннель: $public"
 
 Step "Самопроверка через интернет"
 try {
-    $body = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"selftest","version":"VER"}}}'.Replace("VER", $Ver)
+    $protocol = & $VenvPy -c "import sys; sys.path.insert(0, 'server'); from mcp_protocol import LEGACY_PROTOCOL_VERSION; print(LEGACY_PROTOCOL_VERSION)"
+    if ($LASTEXITCODE -ne 0) { throw "Failed to load MCP protocol version" }
+    $body = @{
+        jsonrpc = "2.0"
+        id = 1
+        method = "initialize"
+        params = @{
+            protocolVersion = $protocol
+            capabilities = @{}
+            clientInfo = @{ name = "selftest"; version = $Ver }
+        }
+    } | ConvertTo-Json -Depth 4 -Compress
     $hdr = @{ "Accept" = "application/json, text/event-stream"; "ngrok-skip-browser-warning" = "1" }
     if ($useToken) { $hdr["Authorization"] = "Bearer $($cfg.secret)" }
     $r = Invoke-WebRequest -Uri $mcpUrl -Method Post -Body $body -ContentType "application/json" -UseBasicParsing -TimeoutSec 20 -Headers $hdr

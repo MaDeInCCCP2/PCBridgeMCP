@@ -18,7 +18,7 @@ class ComputerUseError(ValueError):
 
 
 class ComputerUseClient:
-    def __init__(self, worker_path, log_path, timeout=15, python=None, worker_args=None, kill_tree=False):
+    def __init__(self, worker_path, log_path, timeout=15, python=None, worker_args=None, kill_tree=False, close_at_exit=True):
         self.worker_path, self.log_path = Path(worker_path), Path(log_path)
         self.timeout = max(.1, min(float(timeout), 60))
         self.python = python or sys.executable
@@ -26,7 +26,8 @@ class ComputerUseClient:
         self.kill_tree=kill_tree
         self.lock = threading.Lock()
         self.proc = self.messages = self.log = None
-        atexit.register(self.close)
+        if close_at_exit:
+            atexit.register(self.close)
 
     def _start(self):
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -98,12 +99,14 @@ class ComputerUseClient:
             self.log = None
         self.messages = None
 
-    def call(self, operation, arguments=None, timeout=None):
+    def call(self, operation, arguments=None, timeout=None, *, start=True):
         if not self.lock.acquire(timeout=2):
             raise ComputerUseError('ui_busy', 'Another UI operation is running. Wait before observing again.')
-        mutating = operation in {'action','run_steps','open','navigate','close_page','download_save','trace'}
+        mutating = operation in {'action','owned_action','run_steps','open','navigate','close_page','download_save','trace','session_open','session_close'}
         try:
             if self.proc is None or self.proc.poll() is not None:
+                if not start:
+                    return {"sessions": []}
                 self.close()
                 self._start()
             request_id = uuid.uuid4().hex

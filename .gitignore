@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+.venv-previous-*/
+config.json
+ngrok_accounts.json
+TOKEN.txt
+URL.txt
+oauth.sqlite3*
+logs/
+workspace/
+data/
+latin.flag
+tools/*.exe

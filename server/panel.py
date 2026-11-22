@@ -8,6 +8,7 @@ cannot send it), GET requests never change anything.
 import difflib
 import hmac
 import json
+import re
 import importlib.util
 import secrets
 import socket
@@ -194,10 +195,11 @@ def toast_xml(title: str, text: str, actions=(), launch: str = "") -> str:
     """Windows toast with buttons; every button opens a link (the panel)."""
     q = lambda s: xml_escape(str(s), {'"': "&quot;"})  # noqa: E731
     head = f'<toast activationType="protocol" launch="{q(launch)}">' if launch else "<toast>"
-    lines = "".join(f"<text>{q(x)}</text>" for x in [title] + str(text).split("\n")[:2])
+    lines = f'<text hint-maxLines="1">{q(title)}</text>'
+    lines += "".join(f'<text hint-maxLines="2">{q(line)}</text>' for line in str(text).splitlines()[:2] if line)
     acts = "".join(f'<action content="{q(c)}" activationType="protocol" arguments="{q(u)}"/>' for c, u in actions)
     return (head + f'<visual><binding template="ToastGeneric">{lines}</binding></visual>'
-            + (f"<actions>{acts}</actions>" if acts else "") + "</toast>")
+            + (f"<actions>{acts}</actions>" if acts else "") + '<audio silent="true"/></toast>')
 
 
 def _http(url: str, method: str = "GET", headers=None, body: bytes = None, timeout: float = 8):
@@ -249,8 +251,10 @@ def check_connection(cfg: dict, ngrok_url: str, ngrok_error: str = "", last_call
                 "Адрес не открывается снаружи. Чаще всего это интернет, VPN/антивирус или туннель только что "
                 "перезапустился - подождите минуту и проверьте снова."):
         return steps
+    from mcp_protocol import LEGACY_PROTOCOL_VERSION
+
     init = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-        "protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "pcbridge-check", "version": "1"}}}
+        "protocolVersion": LEGACY_PROTOCOL_VERSION, "capabilities": {}, "clientInfo": {"name": "pcbridge-check", "version": "1"}}}
     ).encode()
     h = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
     if token_auth:
@@ -310,6 +314,7 @@ class Panel:
     def stop(self):
         if self.httpd:
             self.httpd.shutdown()
+            self.httpd.server_close()
 
     # ---- data ----
     def state(self) -> dict:
@@ -364,22 +369,65 @@ class Panel:
         return self.check_result
 
     def undo(self, ids: list) -> dict:
+        return self.control("undo", {"ids": ids})
+
+    def control(self, route, data, *, timeout=60):
         cfg = self.sup.cfg
         port = int(cfg.get("ctrl_port", int(cfg.get("port", 8765)) + 3))
         key = self.m.ctrl_key(str(cfg.get("secret", "")))
-        req = urllib.request.Request(f"http://127.0.0.1:{port}/undo", method="POST",
-                                     data=json.dumps({"ids": ids}).encode(),
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/{route}", method="POST",
+                                     data=json.dumps(data).encode(),
                                      headers={"X-PCB-Key": key, "Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
+            if route == "browser-sessions":
+                return {"error": "Браузер занят. Повторите позже."}
             return {"error": f"сервер ответил {e.code}"}
-        except Exception as e:
-            return {"error": "сервер не запущен - отмена невозможна (" + str(e) + ")"}
+        except (OSError, ValueError):
+            return {"error": "сервер не запущен"}
+
+    def diagnostics(self):
+        from diagnostics import recent_diagnostics
+
+        return {"schema_version": 1, "pcbridge_version": self.sup.version,
+                "events": recent_diagnostics(self.m.LOGS / "diagnostics.jsonl")}
+
+    def oauth_clients(self):
+        database = self.m.ROOT / "oauth.sqlite3"
+        if not database.is_file():
+            return []
+        from oauth_store import OAuthStore
+
+        store = OAuthStore(database, str(self.sup.cfg["secret"]))
+        return [{"id": client_id, "name": name} for client_id, name in store.clients()]
+
+    def extensions(self):
+        from extensions import Extensions
+
+        registry = Extensions(self.m.ROOT)
+        return {kind: registry.list(kind) for kind in ("skill", "plugin")}
 
     def action(self, what: str, data: dict) -> dict:
         s, m = self.sup, self.m
+        if what == "oauth_revoke":
+            client_id = data.get("client_id")
+            if not isinstance(client_id, str) or client_id not in {c["id"] for c in self.oauth_clients()}:
+                return {"error": "Клиент OAuth не найден"}
+            from oauth_store import OAuthStore
+
+            store = OAuthStore(m.ROOT / "oauth.sqlite3", str(s.cfg["secret"]))
+            store.remove_client(client_id)
+            return {"ok": True}
+        if what == "extension_enable":
+            kind, name, enabled = data.get("kind"), data.get("name"), data.get("enabled")
+            if not isinstance(name, str) or not isinstance(enabled, bool):
+                return {"error": "Некорректный параметр расширения"}
+            from extensions import Extensions
+
+            Extensions(m.ROOT).set_enabled(kind, name, enabled)
+            return {"ok": True}
         if what in ("ngrok_add", "ngrok_select", "ngrok_delete"):
             profiles = s.ngrok.profiles()
             accounts = profiles.setdefault("accounts", [])
@@ -427,7 +475,7 @@ class Panel:
             s.restart_bridge()
         elif what == "open":
             target = {"workspace": s.cfg.get("workspace") or m.ROOT, "logs": m.LOGS, "root": m.ROOT,
-                      "readme": m.ROOT / "README.txt"}.get(data.get("target"))
+                      "readme": m.ROOT / "README.md"}.get(data.get("target"))
             if target is None:
                 return {"error": "нечего открывать"}
             s.open_path(target)
@@ -451,7 +499,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, code: int, body, ctype="application/json; charset=utf-8"):
+    def _send(self, code: int, body, ctype="application/json; charset=utf-8", *, attachment=None):
         if not isinstance(body, (bytes, str)):
             body = json.dumps(body, ensure_ascii=False)
         if isinstance(body, str):
@@ -462,6 +510,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
+        if attachment:
+            self.send_header("Content-Disposition", f'attachment; filename="{attachment}"')
         self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'unsafe-inline'; "
                                                    "style-src 'unsafe-inline'; img-src data:; frame-ancestors 'none'")
         self.end_headers()
@@ -490,6 +540,25 @@ class Handler(BaseHTTPRequestHandler):
         P, m = self.panel, self.panel.m
         if u.path == "/api/state":
             return self._send(200, P.state())
+        if u.path == "/api/mcp-tools":
+            catalog = P.control("tool-catalog", {}, timeout=3)
+            return self._send(503 if "error" in catalog else 200, catalog)
+        if u.path == "/api/diagnostics":
+            return self._send(200, P.diagnostics())
+        if u.path == "/api/diagnostics/export":
+            return self._send(200, P.diagnostics(), attachment="pcbridge-diagnostics.json")
+        if u.path == "/api/sessions":
+            return self._send(200, P.control("browser-sessions", {}))
+        if u.path == "/api/jobs":
+            return self._send(200, P.control("jobs", {}, timeout=5))
+        if u.path == "/api/desktop-sessions":
+            return self._send(200, P.control("desktop-sessions", {}))
+        if u.path in ("/api/oauth-clients", "/api/extensions"):
+            try:
+                state = {"clients": P.oauth_clients()} if u.path == "/api/oauth-clients" else P.extensions()
+                return self._send(200, state)
+            except (OSError, ValueError):
+                return self._send(503, {"error": "Реестр недоступен"})
         if u.path == "/api/feed":
             try:
                 pos = int((q.get("pos") or ["-1"])[0])
@@ -509,13 +578,40 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(403, {"error": "host"})
         if not self._key_ok(self.headers.get("X-PCB-Panel", "")):
             return self._send(403, {"error": "key"})
-        try:
-            n = min(int(self.headers.get("Content-Length") or 0), 1_000_000)
-            data = json.loads(self.rfile.read(n) or b"{}")
-        except ValueError:
-            return self._send(400, {"error": "bad json"})
-        P = self.panel
         path = urllib.parse.urlparse(self.path).path
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n < 0:
+                raise ValueError("negative length")
+            if path == "/api/diagnostic-replay":
+                from diagnostics import REPLAY_BODY_LIMIT
+                if n > REPLAY_BODY_LIMIT:
+                    return self._send(413, {"error": "Запрос слишком большой"})
+            data = json.loads(self.rfile.read(min(n, 1_000_000)) or b"{}")
+        except (ValueError, RecursionError):
+            return self._send(400, {"error": "Некорректный JSON"})
+        P = self.panel
+        if path == "/api/diagnostic-replay":
+            if (not isinstance(data, dict) or not isinstance(data.get("name"), str)
+                    or not isinstance(data.get("arguments"), dict)):
+                return self._send(400, {"error": "Укажите имя инструмента и аргументы в виде объекта JSON"})
+            result = P.control("diagnostic-replay", {"name": data["name"], "arguments": data["arguments"]}, timeout=5)
+            return self._send(200, result)
+        if path in ("/api/job-stop", "/api/browser-session-close"):
+            if not isinstance(data, dict):
+                return self._send(400, {"error": "Некорректный запрос"})
+            return self._send(200, P.control(path.removeprefix("/api/"), data, timeout=35))
+        if path == "/api/desktop-session-input":
+            session_id = data.get("session_id") if isinstance(data, dict) else None
+            paused = data.get("paused") if isinstance(data, dict) else None
+            if not isinstance(session_id, str) or not re.fullmatch(r"[0-9a-f]{32}", session_id) or type(paused) is not bool:
+                return self._send(400, {"error": "Проверьте идентификатор сессии и режим ввода"})
+            return self._send(200, P.control("desktop-session-input", {"session_id": session_id, "paused": paused}, timeout=5))
+        if path == "/api/desktop-session-close":
+            session_id = data.get("session_id") if isinstance(data, dict) else None
+            if not isinstance(session_id, str) or len(session_id) != 32:
+                return self._send(400, {"error": "Сессия недоступна"})
+            return self._send(200, P.control("desktop-session-close", {"session_id": session_id}))
         if path == "/api/check":
             return self._send(200, P.run_check())
         if path == "/api/undo":

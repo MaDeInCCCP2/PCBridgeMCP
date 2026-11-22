@@ -190,6 +190,51 @@ class PersistentJobs(unittest.TestCase):
         self.assertIsNotNone(original['proc'].poll())
         original['fh'].close()
 
+    def test_job_ownership_and_quota_survive_recovery(self):
+        def start_client(owner, resources=None):
+            token = S._principal.set(owner)
+            try:
+                return S.start_job([sys.executable, "-c", "import time; time.sleep(30)"], str(WORK),
+                                   "test-private-command", resources=resources)
+            finally:
+                S._principal.reset(token)
+
+        with patch.dict(S.CFG, {"job_max_active_per_client": 1}):
+            first = start_client("client-a", ["shared-resource"])["job_id"]
+            self.addCleanup(self.stop, first)
+            conflict = start_client("client-b", ["shared-resource"])
+            self.assertEqual(conflict["error_code"], "resource_busy")
+            self.assertNotIn("owner_job_id", conflict)
+            self.assertEqual(start_client("client-a")["error_code"], "job_quota")
+            second = start_client("client-b")["job_id"]
+            self.addCleanup(self.stop, second)
+
+            original = {jid: S.JOBS[jid] for jid in (first, second)}
+            S._load_jobs()
+            try:
+                for caller, own, other in (("client-a", first, second), ("client-b", second, first)):
+                    token = S._principal.set(caller)
+                    try:
+                        self.assertEqual([job["job_id"] for job in call(S.job_status)["jobs"]], [own])
+                        for operation in (S.job_status, S.read_job_output, S.job_stop):
+                            with self.assertRaises(S.BridgeError) as denied:
+                                call(operation, job_id=other)
+                            self.assertEqual(denied.exception.code, "unknown_job")
+                        self.assertEqual(start_client(caller)["error_code"], "job_quota")
+                    finally:
+                        S._principal.reset(token)
+
+                history = {job["job_id"]: job for job in S._panel_jobs()["jobs"]}
+                self.assertTrue(history[first]["recovered"])
+                self.assertEqual(history[second]["owner"], "client-b")
+                self.assertNotIn("test-private-command", json.dumps(history))
+                self.assertNotIn("resources", history[first])
+                self.assertTrue(S._stop_job(first)["stopped"])
+                self.assertEqual(call(S.job_status, job_id=first)["status"], "stopped")
+            finally:
+                for job in original.values():
+                    job["fh"].close()
+
     def test_real_server_process_restart(self):
         # A separate launcher exits with os._exit, losing all Python state.
         import importlib.util
@@ -261,15 +306,15 @@ class Transport(unittest.TestCase):
         from mcp.types import CallToolResult
         r=self.mcp_call('file_info',{'path':'missing-file.txt'})
         self.assertIsInstance(r,CallToolResult)
-        self.assertTrue(r.structuredContent['ok']);self.assertFalse(r.isError)
+        self.assertTrue(r.structured_content['ok']);self.assertFalse(r.is_error)
         e=self.mcp_call('apply_file_edits',{'plan_id':'bad'})
-        self.assertTrue(e.isError);self.assertEqual(e.structuredContent['error_code'],'invalid_plan')
+        self.assertTrue(e.is_error);self.assertEqual(e.structured_content['error_code'],'invalid_plan')
 
     def test_legacy_dict_and_text_tools(self):
         from mcp.types import CallToolResult
         r=self.mcp_call('server_info',{})
         self.assertIsInstance(r,CallToolResult)
-        self.assertIn('version',r.structuredContent)
+        self.assertIn('version',r.structured_content)
         (WORK/'transport.txt').write_bytes(b'hello\n')
         text=self.mcp_call('read_text_file',{'path':'transport.txt'})
         self.assertIn('hello',str(text))

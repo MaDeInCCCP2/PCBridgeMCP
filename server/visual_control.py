@@ -28,9 +28,9 @@ def fail(code, message):
 def result(data, frame=None):
     content = [TextContent(type="text", text=json.dumps(data, ensure_ascii=False))]
     if frame:
-        content.append(ImageContent(type="image", mimeType="image/jpeg",
+        content.append(ImageContent(type="image", mime_type="image/jpeg",
                                     data=base64.b64encode(frame["jpeg"]).decode("ascii")))
-    return CallToolResult(content=content, structuredContent=data, isError=not data.get("ok", True))
+    return CallToolResult(content=content, structured_content=data, is_error=not data.get("ok", True))
 
 
 def inside(rect, x, y):
@@ -41,6 +41,38 @@ def integer(value, low, high, name):
     if type(value) is not int or not low <= value <= high:
         fail("invalid_argument", f"{name} must be an integer in {low}..{high}")
     return value
+
+
+def changed_components(mask, bounds, tile_size=64, limit=24):
+    """Cluster neighboring tiles and bound changed pixels inside each cluster."""
+    left, top, right, bottom = bounds
+    remaining = {}
+    for row in range(top // tile_size, (bottom - 1) // tile_size + 1):
+        for col in range(left // tile_size, (right - 1) // tile_size + 1):
+            x, y = col * tile_size, row * tile_size
+            hit = mask.crop((x, y, min(x + tile_size, right), min(y + tile_size, bottom))).getbbox()
+            if hit:
+                remaining[col, row] = (hit[0] + x, hit[1] + y, hit[2] + x, hit[3] + y)
+    regions = []
+    while remaining:
+        todo = [next(iter(remaining))]
+        l, t, r, b = remaining.pop(todo[0])
+        while todo:
+            x, y = todo.pop()
+            for cell in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                hit = remaining.pop(cell, None)
+                if hit:
+                    l, t, r, b = min(l, hit[0]), min(t, hit[1]), max(r, hit[2]), max(b, hit[3])
+                    todo.append(cell)
+        regions.append((l, t, r, b))
+        if len(regions) == limit and remaining:
+            return [bounds], True
+    return regions, False
+
+
+def offset_box(box, region):
+    x, y = region[:2] if region else (0, 0)
+    return [box[0] + x, box[1] + y, box[2] + x, box[3] + y]
 
 
 class WindowsDesktop:
@@ -218,9 +250,10 @@ class WindowsDesktop:
 
 
 class Controller:
-    def __init__(self, desktop, policy, approve, *, history=None, persist=None):
+    def __init__(self, desktop, policy, approve, *, history=None, persist=None, principal=lambda: "owner"):
         self.desktop, self.policy, self.approve = desktop, policy, approve
         self.persist = persist
+        self.principal = principal
         self.lock = threading.RLock()
         self.input_lock = threading.Lock()
         self.windows = OrderedDict()
@@ -233,16 +266,27 @@ class Controller:
                 previous = previous | {"ok": False, "status": "interrupted", "outcome": "unknown",
                                        "input_sent": None, "error_code": "outcome_unknown",
                                        "error": "Bridge restarted during the operation. Observe before continuing."}
-            self.operations[previous["operation_id"]] = previous
-        self.active = None
+            previous = dict(previous)
+            owner = previous.pop("owner", "owner")
+            if isinstance(owner, str):
+                self.operations[(owner, previous["operation_id"])] = previous
+        self._active = None
+
+    @property
+    def active(self):
+        with self.lock:
+            if self._active and self._active[0] == self.principal():
+                return self._active[1]
+            return None
 
     def checkpoint(self):
         if self.persist:
-            self.persist([{k: v for k, v in entry.items() if k != "stop"} for entry in self.operations.values()])
+            self.persist([{**{k: v for k, v in entry.items() if k != "stop"}, "owner": owner}
+                          for (owner, _), entry in self.operations.items()])
 
     def window(self, window_ref):
         with self.lock:
-            target = self.windows.get(window_ref)
+            target = self.windows.get((self.principal(), window_ref))
         if not target or self.desktop.identity(target["hwnd"]) != target:
             fail("window_changed", "Window reference has expired or its identity changed.")
         return target
@@ -254,7 +298,7 @@ class Controller:
             fail("window_changed", "Target identity changed during window selection.")
         ref = uuid.uuid4().hex
         with self.lock:
-            self.windows[ref] = target
+            self.windows[(self.principal(), ref)] = target
             while len(self.windows) > 128:
                 self.windows.popitem(last=False)
         return ref
@@ -262,7 +306,7 @@ class Controller:
     def frame(self, window_ref, capture_id, max_age=120000):
         with self.lock:
             frame = self.frames.get(capture_id)
-        if not frame or frame["public"]["window_ref"] != window_ref:
+        if not frame or frame["owner"] != self.principal() or frame["public"]["window_ref"] != window_ref:
             fail("capture_stale", "Capture is missing, expired or belongs to a different window reference.")
         if (time.monotonic()-frame["created"])*1000 > max_age:
             fail("capture_stale", "Capture is older than max_capture_age_ms.")
@@ -331,7 +375,7 @@ class Controller:
                   "transform": {"origin": screen_rect[:2], "scale_x": source_size[0]/shape[0],
                                 "scale_y": source_size[1]/shape[1], "dpi_scale": geometry["dpi"]/96},
                   "size_bytes": len(jpeg), "sha256": hashlib.sha256(jpeg).hexdigest()}
-        frame = {"public": public, "jpeg": jpeg, "created": started, "client": client, "max_side": max_side,
+        frame = {"public": public, "jpeg": jpeg, "created": started, "owner": self.principal(), "client": client, "max_side": max_side,
                  "region": region, "zoom": zoom, "strict": strict, "method": method}
         with self.lock:
             self.frames[capture_id] = frame
@@ -382,7 +426,7 @@ class Controller:
         return self.observe(frame["public"]["window_ref"], frame["method"], frame["client"], frame["strict"],
                             False, frame["max_side"], frame["region"], frame["zoom"])
 
-    def verify(self, frame, region=None, condition="changed", threshold=1):
+    def verify(self, frame, region=None, condition="changed", threshold=1, *, detailed=False):
         integer(threshold, 1, 255, "threshold")
         if condition not in ("changed", "unchanged"):
             fail("invalid_argument", "condition must be changed or unchanged.")
@@ -404,9 +448,18 @@ class Controller:
             channels = ImageChops.difference(left, right).split()
             diff = ImageChops.lighter(ImageChops.lighter(channels[0], channels[1]), channels[2])
             hist = diff.histogram()
-            changed = sum(hist[threshold:]) > 0
-        return {"verified": changed == (condition == "changed"), "condition": condition,
-                "changed_fraction": sum(hist[threshold:])/sum(hist), "evidence": "pixel_comparison"}, b
+            changed_pixels = sum(hist[threshold:])
+            mask = diff.point([0] * threshold + [255] * (256 - threshold)) if changed_pixels else None
+            bounds = mask.getbbox() if mask is not None else None
+            regions, coalesced = changed_components(mask, bounds) if detailed and bounds else ([], False)
+        verification = {"verified": bool(changed_pixels) == (condition == "changed"), "condition": condition,
+                        "changed_fraction": changed_pixels / sum(hist),
+                        "changed_bounds": offset_box(bounds, region) if bounds else None,
+                        "evidence": "pixel_comparison"}
+        if detailed:
+            verification["changed_regions"] = [offset_box(box, region) for box in regions]
+            verification["regions_coalesced"] = coalesced
+        return verification, b
 
     def validate_steps(self, steps):
         allowed = {
@@ -473,7 +526,7 @@ class Controller:
 
     def operation(self, operation_id, cancel=False):
         with self.lock:
-            entry = self.operations.get(operation_id)
+            entry = self.operations.get((self.principal(), operation_id))
             if not entry:
                 fail("operation_not_found", "Unknown or expired operation_id.")
             if cancel and entry["status"] == "running":
@@ -488,8 +541,9 @@ class Controller:
         integer(timeout, 100, 30000, "timeout_ms")
         if not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", operation_id):
             fail("invalid_argument", "operation_id must contain 8..80 letters, digits, underscores or hyphens.")
+        operation_key = (self.principal(), operation_id)
         with self.lock:
-            if operation_id in self.operations:
+            if operation_key in self.operations:
                 return self.operation(operation_id), None
         steps = self.validate_steps(steps)
         frame = self.frame(ref, capture_id, max_age)
@@ -513,18 +567,18 @@ class Controller:
                   "window_ref": ref, "initial_capture_id": capture_id, "completed_steps": [],
                   "input_sent": False, "events_sent": 0, "postcondition_verified": None, "retry_action": False}
         with self.lock:
-            if operation_id in self.operations:
+            if operation_key in self.operations:
                 self.input_lock.release()
                 return self.operation(operation_id), None
-            self.operations[operation_id] = record | {"stop": stop}
+            self.operations[operation_key] = record | {"stop": stop}
             while len(self.operations) > 128:
                 self.operations.popitem(last=False)
-            self.active = operation_id
+            self._active = operation_key
             try:
                 self.checkpoint()
             except OSError:
-                self.operations.pop(operation_id, None)
-                self.active = None
+                self.operations.pop(operation_key, None)
+                self._active = None
                 self.input_lock.release()
                 fail("operation_history_unavailable", "Cannot commit deduplication state before input.")
         held = []
@@ -537,7 +591,7 @@ class Controller:
 
         def publish():
             with self.lock:
-                self.operations[operation_id] = record | {"completed_steps": list(record["completed_steps"]), "stop": stop}
+                self.operations[operation_key] = record | {"completed_steps": list(record["completed_steps"]), "stop": stop}
 
         def guard(point=None, cursor=None):
             self._guard(frame, target, max_age, stop, deadline, point, cursor)
@@ -673,8 +727,8 @@ class Controller:
             if final_frame:
                 record["observation"] = final_frame["public"]
             with self.lock:
-                self.operations[operation_id] = record | {"stop": stop}
-                self.active = None
+                self.operations[operation_key] = record | {"stop": stop}
+                self._active = None
                 try:
                     self.checkpoint()
                 except OSError:

@@ -1,6 +1,8 @@
 # The same list is installed by setup.ps1 (START.bat) - keep them in sync.
-mcp>=1.10,<2
+mcp>=2.3,<3
 httpx>=0.27,<1
+httpx2>=2.10,<3  # SDK v2 external MCP transport
+PyYAML>=6.0.2,<7   # Agent Skills frontmatter
 pillow>=10.4,<13
 send2trash>=1.8,<2   # delete_path -> Recycle Bin
 pyautogui>=0.9.54,<1  # only for the 'input' module (mouse/keyboard)
@@ -10,6 +12,7 @@ pystray>=0.19,<1      # tray icon (supervisor.py)
 # Semantic Computer Use, Windows screen module (lazy-loaded in an isolated worker).
 pywinauto>=0.6.8,<0.7; sys_platform == "win32"
 comtypes>=1.4.8,<2; sys_platform == "win32"
+pywin32>=310; sys_platform == "win32"   # Win32 Desktop and Job Objects
 
 playwright>=1.64,<2  # optional browser module, isolated worker
 
